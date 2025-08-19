@@ -1,0 +1,26 @@
+meta {
+  name: create queue
+  type: http
+  seq: 2
+}
+
+post {
+  url: http://localhost:3000/queues
+  body: json
+  auth: inherit
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "name": "notifications",
+    "visibility_timeout_seconds": 120
+  }
+}
+
+settings {
+  encodeUrl: false
+}

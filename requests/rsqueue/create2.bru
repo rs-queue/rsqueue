@@ -1,0 +1,31 @@
+meta {
+  name: create2
+  type: http
+  seq: 1
+}
+
+post {
+  url: http://localhost:3000/shorten
+  body: json
+  auth: inherit
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "url": "https://example.com",
+    "custom_code": "example",
+    "expires_in_days": 30,
+    "tags": [
+      "demo",
+      "newsletter"
+    ]
+  }
+}
+
+settings {
+  encodeUrl: false
+}

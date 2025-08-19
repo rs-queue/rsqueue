@@ -1,0 +1,175 @@
+use axum::{
+    response::{Json, Response},
+    routing::{delete, get, post},
+    Router,
+};
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use chrono::{DateTime, Utc};
+use prometheus::{TextEncoder, Encoder};
+use rsqueue::*;
+use serde::Serialize;
+use std::{path::PathBuf, time::SystemTime};
+use tower_http::cors::CorsLayer;
+use tracing::info;
+
+// Health check and monitoring endpoints
+#[derive(Serialize)]
+struct HealthStatus {
+    status: String,
+    timestamp: DateTime<Utc>,
+    uptime_seconds: u64,
+    version: String,
+    active_queues: usize,
+    total_messages: usize,
+}
+
+#[derive(Serialize)]
+struct MetricsSummary {
+    timestamp: DateTime<Utc>,
+    messages_enqueued_total: u64,
+    messages_dequeued_total: u64,
+    messages_deleted_total: u64,
+    duplicate_messages_rejected_total: u64,
+    messages_expired_total: u64,
+    queues_created_total: u64,
+    queues_deleted_total: u64,
+    queues_purged_total: u64,
+    active_queues: i64,
+    total_messages_pending: i64,
+    total_messages_in_flight: i64,
+    http_requests_total: u64,
+}
+
+#[derive(Serialize)]
+struct QueueMetrics {
+    name: String,
+    messages_pending: usize,
+    messages_in_flight: usize,
+    total_size: usize,
+    visible_messages: usize,
+    dedup_cache_size: usize,
+    created_at: DateTime<Utc>,
+    visibility_timeout_seconds: u64,
+    enable_deduplication: bool,
+}
+
+static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
+
+async fn health_check(State(state): State<AppState>) -> Json<HealthStatus> {
+    state.update_global_metrics().await;
+    
+    let start_time = START_TIME.get_or_init(|| SystemTime::now());
+    let uptime = start_time.elapsed().unwrap_or_default();
+    
+    let queues = state.queues.read().await;
+    let total_messages: usize = queues.values()
+        .map(|q| q.size())
+        .sum();
+    
+    Json(HealthStatus {
+        status: "healthy".to_string(),
+        timestamp: Utc::now(),
+        uptime_seconds: uptime.as_secs(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        active_queues: queues.len(),
+        total_messages,
+    })
+}
+
+async fn get_metrics() -> Response {
+    let encoder = TextEncoder::new();
+    let metric_families = get_metrics_registry().gather();
+    let mut buffer = Vec::new();
+    
+    if encoder.encode(&metric_families, &mut buffer).is_ok() {
+        let body_string = String::from_utf8_lossy(&buffer).to_string();
+        Response::builder()
+            .header("Content-Type", "text/plain; version=0.0.4")
+            .body(body_string.into())
+            .unwrap()
+    } else {
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body("Failed to encode metrics".into())
+            .unwrap()
+    }
+}
+
+async fn get_metrics_summary() -> Json<MetricsSummary> {
+    Json(MetricsSummary {
+        timestamp: Utc::now(),
+        messages_enqueued_total: get_messages_enqueued_total(),
+        messages_dequeued_total: get_messages_dequeued_total(),
+        messages_deleted_total: get_messages_deleted_total(),
+        duplicate_messages_rejected_total: get_duplicate_messages_rejected_total(),
+        messages_expired_total: get_messages_expired_total(),
+        queues_created_total: get_queues_created_total(),
+        queues_deleted_total: get_queues_deleted_total(),
+        queues_purged_total: get_queues_purged_total(),
+        active_queues: get_active_queues(),
+        total_messages_pending: get_total_messages_pending(),
+        total_messages_in_flight: get_total_messages_in_flight(),
+        http_requests_total: get_http_requests_total(),
+    })
+}
+
+async fn get_queue_metrics(
+    State(state): State<AppState>,
+    Path(queue_name): Path<String>,
+) -> Result<Json<QueueMetrics>, StatusCode> {
+    let queues = state.queues.read().await;
+    if let Some(queue) = queues.get(&queue_name) {
+        Ok(Json(QueueMetrics {
+            name: queue_name,
+            messages_pending: queue.messages.len(),
+            messages_in_flight: queue.in_flight.len(),
+            total_size: queue.size(),
+            visible_messages: queue.get_visible_count(),
+            dedup_cache_size: queue.get_dedup_cache_size(),
+            created_at: queue.spec.created_at,
+            visibility_timeout_seconds: queue.spec.visibility_timeout_seconds,
+            enable_deduplication: queue.spec.enable_deduplication,
+        }))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt::init();
+    
+    let storage_path = PathBuf::from("./queue_specs");
+    let state = AppState::new(storage_path);
+    
+    let app = Router::new()
+        // Health check and monitoring
+        .route("/health", get(health_check))
+        .route("/metrics", get(get_metrics))
+        .route("/metrics/summary", get(get_metrics_summary))
+        .route("/queues/:name/metrics", get(get_queue_metrics))
+        
+        // Queue management
+        .route("/queues", post(create_queue))
+        .route("/queues", get(list_queues))
+        .route("/queues/:name", delete(delete_queue))
+        .route("/queues/:name/purge", post(purge_queue))
+        
+        // Message operations
+        .route("/queues/:name/messages", post(enqueue_message))
+        .route("/queues/:name/messages/batch", post(enqueue_batch))
+        .route("/queues/:name/messages/get", post(get_messages))
+        .route("/queues/:name/messages/:receipt_handle", delete(delete_message))
+        
+        .layer(CorsLayer::permissive())
+        .with_state(state);
+    
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+        .await
+        .unwrap();
+    
+    info!("RSQueue server running on http://0.0.0.0:3000");
+    
+    axum::serve(listener, app).await.unwrap();
+}

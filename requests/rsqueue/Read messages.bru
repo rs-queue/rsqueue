@@ -1,0 +1,25 @@
+meta {
+  name: Read messages
+  type: http
+  seq: 3
+}
+
+post {
+  url: http://localhost:3000/queues/task-queue/messages/get
+  body: json
+  auth: inherit
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "count": 1
+  }
+}
+
+settings {
+  encodeUrl: false
+}

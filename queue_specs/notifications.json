@@ -1,0 +1,7 @@
+{
+  "name": "notifications",
+  "created_at": "2025-08-08T18:34:33.624475Z",
+  "visibility_timeout_seconds": 120,
+  "enable_deduplication": false,
+  "deduplication_window_seconds": 300
+}
