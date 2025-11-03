@@ -241,7 +241,7 @@ async fn main() {
         // Queue management
         .route("/queues", post(create_queue))
         .route("/queues", get(list_queues))
-        .route("/queues/:name", dclaude elete(delete_queue))
+        .route("/queues/:name", delete(delete_queue))
         .route("/queues/:name/settings", put(update_queue_settings))
         .route("/queues/:name/purge", post(purge_queue))
         
