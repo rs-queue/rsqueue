@@ -12,8 +12,8 @@ use chrono::{DateTime, Utc};
 use prometheus::{TextEncoder, Encoder};
 use rsqueue::*;
 use serde::Serialize;
-use std::{path::PathBuf, time::SystemTime};
-use tower_http::cors::CorsLayer;
+use std::{path::PathBuf, time::{Duration, SystemTime}};
+use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 use utoipa::{OpenApi, ToSchema};
 
@@ -323,7 +323,16 @@ async fn main() {
         // Queue details
         .route("/queues/:name/details", get(get_queue_details))
 
-        .layer(CorsLayer::permissive())
+        // Configure CORS to allow all origins, methods, and headers
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any)
+                .expose_headers(Any)
+                // Note: Cannot use allow_credentials(true) with wildcard origins/headers
+                .max_age(Duration::from_secs(3600))
+        )
         .with_state(state.clone());
 
     // Apply authentication middleware if configured
