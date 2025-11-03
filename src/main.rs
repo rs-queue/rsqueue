@@ -2,9 +2,12 @@ use axum::{
     response::{Json, Response},
     routing::{delete, get, post, put},
     Router,
+    middleware,
 };
-use axum::extract::{Path, State};
+use axum::extract::{Path, State, Request};
 use axum::http::StatusCode;
+use axum::middleware::Next;
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use prometheus::{TextEncoder, Encoder};
 use rsqueue::*;
@@ -219,32 +222,96 @@ async fn get_queue_metrics(
     }
 }
 
+// Basic auth validator that compares against environment variables
+#[derive(Clone)]
+struct BasicAuthValidator {
+    username: String,
+    password: String,
+}
+
+impl BasicAuthValidator {
+    fn from_env() -> Option<Self> {
+        let username = std::env::var("AUTH_USER").ok()?;
+        let password = std::env::var("AUTH_PASSWORD").ok()?;
+
+        if username.is_empty() || password.is_empty() {
+            return None;
+        }
+
+        Some(Self { username, password })
+    }
+
+    fn validate(&self, auth_header: Option<&str>) -> bool {
+        let Some(auth_value) = auth_header else {
+            return false;
+        };
+
+        // Parse Basic auth header (format: "Basic base64(username:password)")
+        if let Some(encoded) = auth_value.strip_prefix("Basic ") {
+            if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) {
+                if let Ok(auth_str) = String::from_utf8(decoded) {
+                    if let Some((user, pass)) = auth_str.split_once(':') {
+                        return user == self.username && pass == self.password;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+// Middleware function for basic authentication
+async fn basic_auth_middleware(
+    State(validator): State<BasicAuthValidator>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let auth_header = request
+        .headers()
+        .get("Authorization")
+        .and_then(|value| value.to_str().ok());
+
+    if validator.validate(auth_header) {
+        next.run(request).await
+    } else {
+        // Return 401 Unauthorized with WWW-Authenticate header
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("WWW-Authenticate", "Basic realm=\"RSQueue\"")
+            .body("Authentication required".into())
+            .unwrap()
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
-    
+
     let storage_path = PathBuf::from("./queue_specs");
     let state = AppState::new(storage_path);
-    
+
+    // Check for authentication configuration
+    let auth_validator = BasicAuthValidator::from_env();
+
     let app = Router::new()
         // Add OpenAPI JSON endpoint
         .route("/api-docs/openapi.json", get(|| async {
             Json(ApiDoc::openapi())
         }))
-        
+
         // Health check and monitoring
         .route("/health", get(health_check))
         .route("/metrics", get(get_metrics))
         .route("/metrics/summary", get(get_metrics_summary))
         .route("/queues/:name/metrics", get(get_queue_metrics))
-        
+
         // Queue management
         .route("/queues", post(create_queue))
         .route("/queues", get(list_queues))
         .route("/queues/:name", delete(delete_queue))
         .route("/queues/:name/settings", put(update_queue_settings))
         .route("/queues/:name/purge", post(purge_queue))
-        
+
         // Message operations
         .route("/queues/:name/messages", post(enqueue_message))
         .route("/queues/:name/messages/batch", post(enqueue_batch))
@@ -252,12 +319,24 @@ async fn main() {
         .route("/queues/:name/messages/peek", post(peek_messages))
         .route("/queues/:name/messages/all", get(list_all_messages))
         .route("/queues/:name/messages/:receipt_handle", delete(delete_message))
-        
+
         // Queue details
         .route("/queues/:name/details", get(get_queue_details))
-        
+
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state.clone());
+
+    // Apply authentication middleware if configured
+    let app = if let Some(validator) = auth_validator {
+        info!("Basic authentication enabled for user: {}", validator.username);
+        app.layer(middleware::from_fn_with_state(
+            validator,
+            basic_auth_middleware,
+        ))
+    } else {
+        info!("Basic authentication disabled (set AUTH_USER and AUTH_PASSWORD to enable)");
+        app
+    };
     
     let listener = tokio::net::TcpListener::bind("0.0.0.0:4000")
         .await

@@ -33,6 +33,12 @@ RUN mkdir -p queue_specs && chown -R app:app /app
 
 USER app
 
+# Optional environment variables for Basic Authentication
+# Set both AUTH_USER and AUTH_PASSWORD to enable authentication
+# Example: docker run -e AUTH_USER=admin -e AUTH_PASSWORD=secret123 rsqueue
+ENV AUTH_USER=""
+ENV AUTH_PASSWORD=""
+
 EXPOSE 4000
 
 CMD ["./rsqueue"]
