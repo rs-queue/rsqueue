@@ -7,6 +7,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{DateTime, Duration, Utc};
 use prometheus::{Histogram, IntCounter, IntGauge, Registry};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
@@ -102,7 +103,7 @@ lazy_static::lazy_static! {
 }
 
 // Data structures
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Message {
     pub id: Uuid,
     pub content: String,
@@ -114,7 +115,7 @@ pub struct Message {
     pub visible_after: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QueueSpec {
     pub name: String,
     pub created_at: DateTime<Utc>,
@@ -297,6 +298,100 @@ impl Queue {
     pub fn get_dedup_cache_size(&self) -> usize {
         self.dedup_hashes.len()
     }
+
+    pub fn peek_messages(&self, count: usize, offset: usize) -> Vec<MessagePreview> {
+        let _now = Utc::now();
+        let mut result = Vec::new();
+        
+        // Get pending messages
+        let pending_messages: Vec<MessagePreview> = self.messages
+            .iter()
+            .skip(offset)
+            .take(count)
+            .map(|msg| MessagePreview {
+                id: msg.id,
+                content: msg.content.clone(),
+                created_at: msg.created_at,
+                status: MessageStatus::Pending,
+                visible_after: None,
+            })
+            .collect();
+        
+        result.extend(pending_messages);
+        
+        // If we need more messages, get from in-flight
+        if result.len() < count {
+            let remaining = count - result.len();
+            let in_flight_offset = if offset > self.messages.len() { 
+                offset - self.messages.len() 
+            } else { 
+                0 
+            };
+            
+            let in_flight_messages: Vec<MessagePreview> = self.in_flight
+                .values()
+                .skip(in_flight_offset)
+                .take(remaining)
+                .map(|msg| MessagePreview {
+                    id: msg.id,
+                    content: msg.content.clone(),
+                    created_at: msg.created_at,
+                    status: MessageStatus::InFlight,
+                    visible_after: msg.visible_after,
+                })
+                .collect();
+            
+            result.extend(in_flight_messages);
+        }
+        
+        result
+    }
+
+    pub fn list_all_messages(&self) -> Vec<MessagePreview> {
+        let mut result = Vec::new();
+        
+        // Add all pending messages
+        for msg in &self.messages {
+            result.push(MessagePreview {
+                id: msg.id,
+                content: msg.content.clone(),
+                created_at: msg.created_at,
+                status: MessageStatus::Pending,
+                visible_after: None,
+            });
+        }
+        
+        // Add all in-flight messages
+        for msg in self.in_flight.values() {
+            result.push(MessagePreview {
+                id: msg.id,
+                content: msg.content.clone(),
+                created_at: msg.created_at,
+                status: MessageStatus::InFlight,
+                visible_after: msg.visible_after,
+            });
+        }
+        
+        // Sort by creation time
+        result.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        result
+    }
+
+    pub fn get_detailed_info(&self, queue_name: &str) -> QueueDetailInfo {
+        QueueDetailInfo {
+            name: queue_name.to_string(),
+            size: self.size(),
+            created_at: self.spec.created_at,
+            visibility_timeout_seconds: self.spec.visibility_timeout_seconds,
+            enable_deduplication: self.spec.enable_deduplication,
+            deduplication_window_seconds: self.spec.deduplication_window_seconds,
+            dedup_cache_size: self.get_dedup_cache_size(),
+            messages_pending: self.messages.len(),
+            messages_in_flight: self.in_flight.len(),
+            visible_messages: self.get_visible_count(),
+            recent_messages: self.peek_messages(5, 0), // Show recent 5 messages
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -415,7 +510,7 @@ impl AppState {
 }
 
 // Request/Response types
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateQueueRequest {
     pub name: String,
     #[serde(default = "default_visibility_timeout")]
@@ -426,6 +521,16 @@ pub struct CreateQueueRequest {
     pub deduplication_window_seconds: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UpdateQueueRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility_timeout_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_deduplication: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deduplication_window_seconds: Option<u64>,
+}
+
 pub fn default_visibility_timeout() -> u64 {
     120 // 2 minutes default
 }
@@ -434,41 +539,81 @@ pub fn default_deduplication_window() -> u64 {
     300 // 5 minutes default
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct EnqueueRequest {
     pub content: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct BatchEnqueueRequest {
     pub messages: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct EnqueueResponse {
     pub id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct BatchEnqueueResponse {
     pub results: Vec<EnqueueResponse>,
     pub successful: usize,
     pub failed: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct GetMessagesRequest {
     #[serde(default = "default_count")]
     pub count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PeekMessagesRequest {
+    #[serde(default = "default_count")]
+    pub count: usize,
+    #[serde(default)]
+    pub offset: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct MessagePreview {
+    pub id: uuid::Uuid,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+    pub status: MessageStatus,
+    pub visible_after: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub enum MessageStatus {
+    #[serde(rename = "pending")]
+    Pending,
+    #[serde(rename = "in_flight")]
+    InFlight,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct QueueDetailInfo {
+    pub name: String,
+    pub size: usize,
+    pub created_at: DateTime<Utc>,
+    pub visibility_timeout_seconds: u64,
+    pub enable_deduplication: bool,
+    pub deduplication_window_seconds: u64,
+    pub dedup_cache_size: usize,
+    pub messages_pending: usize,
+    pub messages_in_flight: usize,
+    pub visible_messages: usize,
+    pub recent_messages: Vec<MessagePreview>,
 }
 
 pub fn default_count() -> usize {
     1
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct QueueInfo {
     pub name: String,
     pub size: usize,
@@ -480,6 +625,17 @@ pub struct QueueInfo {
 }
 
 // Handlers
+#[utoipa::path(
+    post,
+    path = "/queues",
+    tag = "queues",
+    request_body = CreateQueueRequest,
+    responses(
+        (status = 201, description = "Queue created successfully", body = QueueSpec),
+        (status = 409, description = "Queue already exists"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub async fn create_queue(
     State(state): State<AppState>,
     Json(req): Json<CreateQueueRequest>,
@@ -514,6 +670,79 @@ pub async fn create_queue(
     Ok(Json(spec))
 }
 
+#[utoipa::path(
+    put,
+    path = "/queues/{name}/settings",
+    tag = "queues",
+    params(
+        ("name" = String, Path, description = "Queue name")
+    ),
+    request_body = UpdateQueueRequest,
+    responses(
+        (status = 200, description = "Queue settings updated successfully", body = QueueSpec),
+        (status = 404, description = "Queue not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn update_queue_settings(
+    State(state): State<AppState>,
+    Path(queue_name): Path<String>,
+    Json(req): Json<UpdateQueueRequest>,
+) -> Result<Json<QueueSpec>, StatusCode> {
+    let _timer = HTTP_REQUEST_DURATION.start_timer();
+    HTTP_REQUESTS_TOTAL.inc();
+
+    let mut queues = state.queues.write().await;
+
+    if let Some(queue) = queues.get_mut(&queue_name) {
+        let mut updated = false;
+
+        if let Some(visibility_timeout) = req.visibility_timeout_seconds {
+            queue.spec.visibility_timeout_seconds = visibility_timeout;
+            updated = true;
+        }
+
+        if let Some(enable_dedup) = req.enable_deduplication {
+            if enable_dedup != queue.spec.enable_deduplication {
+                queue.spec.enable_deduplication = enable_dedup;
+                if !enable_dedup {
+                    queue.dedup_hashes.clear();
+                }
+                updated = true;
+            }
+        }
+
+        if let Some(dedup_window) = req.deduplication_window_seconds {
+            queue.spec.deduplication_window_seconds = dedup_window;
+            updated = true;
+        }
+
+        if updated {
+            let spec = queue.spec.clone();
+            if let Err(e) = state.save_queue_spec(&spec).await {
+                error!("Failed to save updated queue spec: {}", e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+
+            info!("Updated queue settings: {} (dedup: {})", spec.name, spec.enable_deduplication);
+            Ok(Json(spec))
+        } else {
+            let spec = queue.spec.clone();
+            Ok(Json(spec))
+        }
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/queues",
+    tag = "queues",
+    responses(
+        (status = 200, description = "List of all queues", body = [QueueInfo])
+    )
+)]
 pub async fn list_queues(State(state): State<AppState>) -> Json<Vec<QueueInfo>> {
     let _timer = HTTP_REQUEST_DURATION.start_timer();
     HTTP_REQUESTS_TOTAL.inc();
@@ -535,6 +764,18 @@ pub async fn list_queues(State(state): State<AppState>) -> Json<Vec<QueueInfo>> 
     Json(info)
 }
 
+#[utoipa::path(
+    delete,
+    path = "/queues/{name}",
+    tag = "queues",
+    params(
+        ("name" = String, Path, description = "Queue name")
+    ),
+    responses(
+        (status = 204, description = "Queue deleted successfully"),
+        (status = 404, description = "Queue not found")
+    )
+)]
 pub async fn delete_queue(
     State(state): State<AppState>,
     Path(queue_name): Path<String>,
@@ -557,6 +798,19 @@ pub async fn delete_queue(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/queues/{name}/messages",
+    tag = "messages",
+    params(
+        ("name" = String, Path, description = "Queue name")
+    ),
+    request_body = EnqueueRequest,
+    responses(
+        (status = 200, description = "Message enqueued successfully", body = EnqueueResponse),
+        (status = 404, description = "Queue not found")
+    )
+)]
 pub async fn enqueue_message(
     State(state): State<AppState>,
     Path(queue_name): Path<String>,
@@ -583,6 +837,19 @@ pub async fn enqueue_message(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/queues/{name}/messages/batch",
+    tag = "messages",
+    params(
+        ("name" = String, Path, description = "Queue name")
+    ),
+    request_body = BatchEnqueueRequest,
+    responses(
+        (status = 200, description = "Batch messages enqueued", body = BatchEnqueueResponse),
+        (status = 404, description = "Queue not found")
+    )
+)]
 pub async fn enqueue_batch(
     State(state): State<AppState>,
     Path(queue_name): Path<String>,
@@ -619,6 +886,19 @@ pub async fn enqueue_batch(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/queues/{name}/messages/get",
+    tag = "messages",
+    params(
+        ("name" = String, Path, description = "Queue name")
+    ),
+    request_body = GetMessagesRequest,
+    responses(
+        (status = 200, description = "Retrieved messages", body = [Message]),
+        (status = 404, description = "Queue not found")
+    )
+)]
 pub async fn get_messages(
     State(state): State<AppState>,
     Path(queue_name): Path<String>,
@@ -639,6 +919,19 @@ pub async fn get_messages(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/queues/{name}/messages/{receipt_handle}",
+    tag = "messages",
+    params(
+        ("name" = String, Path, description = "Queue name"),
+        ("receipt_handle" = String, Path, description = "Receipt handle of the message")
+    ),
+    responses(
+        (status = 204, description = "Message deleted successfully"),
+        (status = 404, description = "Queue or message not found")
+    )
+)]
 pub async fn delete_message(
     State(state): State<AppState>,
     Path((queue_name, receipt_handle)): Path<(String, Uuid)>,
@@ -659,6 +952,18 @@ pub async fn delete_message(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/queues/{name}/purge",
+    tag = "queues",
+    params(
+        ("name" = String, Path, description = "Queue name")
+    ),
+    responses(
+        (status = 204, description = "Queue purged successfully"),
+        (status = 404, description = "Queue not found")
+    )
+)]
 pub async fn purge_queue(
     State(state): State<AppState>,
     Path(queue_name): Path<String>,
@@ -729,4 +1034,95 @@ pub fn get_total_messages_in_flight() -> i64 {
 
 pub fn get_http_requests_total() -> u64 {
     HTTP_REQUESTS_TOTAL.get()
+}
+
+// New API handlers for peeking at messages
+
+#[utoipa::path(
+    post,
+    path = "/queues/{name}/messages/peek",
+    tag = "messages",
+    params(
+        ("name" = String, Path, description = "Queue name")
+    ),
+    request_body = PeekMessagesRequest,
+    responses(
+        (status = 200, description = "Retrieved messages preview", body = [MessagePreview]),
+        (status = 404, description = "Queue not found")
+    )
+)]
+pub async fn peek_messages(
+    State(state): State<AppState>,
+    Path(queue_name): Path<String>,
+    Json(req): Json<PeekMessagesRequest>,
+) -> Result<Json<Vec<MessagePreview>>, StatusCode> {
+    let _timer = HTTP_REQUEST_DURATION.start_timer();
+    HTTP_REQUESTS_TOTAL.inc();
+    
+    let queues = state.queues.read().await;
+    
+    if let Some(queue) = queues.get(&queue_name) {
+        let messages = queue.peek_messages(req.count, req.offset);
+        Ok(Json(messages))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/queues/{name}/details",
+    tag = "queues",
+    params(
+        ("name" = String, Path, description = "Queue name")
+    ),
+    responses(
+        (status = 200, description = "Queue details with message preview", body = QueueDetailInfo),
+        (status = 404, description = "Queue not found")
+    )
+)]
+pub async fn get_queue_details(
+    State(state): State<AppState>,
+    Path(queue_name): Path<String>,
+) -> Result<Json<QueueDetailInfo>, StatusCode> {
+    let _timer = HTTP_REQUEST_DURATION.start_timer();
+    HTTP_REQUESTS_TOTAL.inc();
+    
+    let queues = state.queues.read().await;
+    
+    if let Some(queue) = queues.get(&queue_name) {
+        let details = queue.get_detailed_info(&queue_name);
+        Ok(Json(details))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/queues/{name}/messages/all",
+    tag = "messages",
+    params(
+        ("name" = String, Path, description = "Queue name")
+    ),
+    responses(
+        (status = 200, description = "All messages in queue", body = [MessagePreview]),
+        (status = 404, description = "Queue not found")
+    )
+)]
+pub async fn list_all_messages(
+    State(state): State<AppState>,
+    Path(queue_name): Path<String>,
+) -> Result<Json<Vec<MessagePreview>>, StatusCode> {
+    let _timer = HTTP_REQUEST_DURATION.start_timer();
+    HTTP_REQUESTS_TOTAL.inc();
+    
+    let queues = state.queues.read().await;
+    
+    if let Some(queue) = queues.get(&queue_name) {
+        let messages = queue.list_all_messages();
+        Ok(Json(messages))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
 }

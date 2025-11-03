@@ -1,6 +1,6 @@
 use axum::{
     response::{Json, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use axum::extract::{Path, State};
@@ -12,9 +12,10 @@ use serde::Serialize;
 use std::{path::PathBuf, time::SystemTime};
 use tower_http::cors::CorsLayer;
 use tracing::info;
+use utoipa::{OpenApi, ToSchema};
 
 // Health check and monitoring endpoints
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct HealthStatus {
     status: String,
     timestamp: DateTime<Utc>,
@@ -24,7 +25,7 @@ struct HealthStatus {
     total_messages: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct MetricsSummary {
     timestamp: DateTime<Utc>,
     messages_enqueued_total: u64,
@@ -41,7 +42,7 @@ struct MetricsSummary {
     http_requests_total: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct QueueMetrics {
     name: String,
     messages_pending: usize,
@@ -54,8 +55,70 @@ struct QueueMetrics {
     enable_deduplication: bool,
 }
 
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        health_check,
+        get_metrics_summary,
+        get_queue_metrics,
+        create_queue,
+        update_queue_settings,
+        list_queues,
+        delete_queue,
+        purge_queue,
+        enqueue_message,
+        enqueue_batch,
+        get_messages,
+        delete_message,
+        peek_messages,
+        get_queue_details,
+        list_all_messages
+    ),
+    components(schemas(
+        HealthStatus,
+        MetricsSummary,
+        QueueMetrics,
+        Message,
+        QueueSpec,
+        CreateQueueRequest,
+        UpdateQueueRequest,
+        EnqueueRequest,
+        BatchEnqueueRequest,
+        EnqueueResponse,
+        BatchEnqueueResponse,
+        GetMessagesRequest,
+        QueueInfo,
+        PeekMessagesRequest,
+        MessagePreview,
+        MessageStatus,
+        QueueDetailInfo
+    )),
+    tags(
+        (name = "health", description = "Health check and monitoring endpoints"),
+        (name = "queues", description = "Queue management operations"),
+        (name = "messages", description = "Message operations")
+    ),
+    info(
+        title = "RSQueue API",
+        description = "A high-performance message queue service built with Rust and Axum",
+        version = "0.1.0",
+        contact(
+            name = "RSQueue Team"
+        )
+    )
+)]
+struct ApiDoc;
+
 static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
 
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "health",
+    responses(
+        (status = 200, description = "Service health status", body = HealthStatus)
+    )
+)]
 async fn health_check(State(state): State<AppState>) -> Json<HealthStatus> {
     state.update_global_metrics().await;
     
@@ -96,6 +159,14 @@ async fn get_metrics() -> Response {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/metrics/summary",
+    tag = "health",
+    responses(
+        (status = 200, description = "Metrics summary", body = MetricsSummary)
+    )
+)]
 async fn get_metrics_summary() -> Json<MetricsSummary> {
     Json(MetricsSummary {
         timestamp: Utc::now(),
@@ -114,6 +185,18 @@ async fn get_metrics_summary() -> Json<MetricsSummary> {
     })
 }
 
+#[utoipa::path(
+    get,
+    path = "/queues/{name}/metrics",
+    tag = "queues",
+    params(
+        ("name" = String, Path, description = "Queue name")
+    ),
+    responses(
+        (status = 200, description = "Queue metrics", body = QueueMetrics),
+        (status = 404, description = "Queue not found")
+    )
+)]
 async fn get_queue_metrics(
     State(state): State<AppState>,
     Path(queue_name): Path<String>,
@@ -144,6 +227,11 @@ async fn main() {
     let state = AppState::new(storage_path);
     
     let app = Router::new()
+        // Add OpenAPI JSON endpoint
+        .route("/api-docs/openapi.json", get(|| async {
+            Json(ApiDoc::openapi())
+        }))
+        
         // Health check and monitoring
         .route("/health", get(health_check))
         .route("/metrics", get(get_metrics))
@@ -153,23 +241,29 @@ async fn main() {
         // Queue management
         .route("/queues", post(create_queue))
         .route("/queues", get(list_queues))
-        .route("/queues/:name", delete(delete_queue))
+        .route("/queues/:name", dclaude elete(delete_queue))
+        .route("/queues/:name/settings", put(update_queue_settings))
         .route("/queues/:name/purge", post(purge_queue))
         
         // Message operations
         .route("/queues/:name/messages", post(enqueue_message))
         .route("/queues/:name/messages/batch", post(enqueue_batch))
         .route("/queues/:name/messages/get", post(get_messages))
+        .route("/queues/:name/messages/peek", post(peek_messages))
+        .route("/queues/:name/messages/all", get(list_all_messages))
         .route("/queues/:name/messages/:receipt_handle", delete(delete_message))
+        
+        // Queue details
+        .route("/queues/:name/details", get(get_queue_details))
         
         .layer(CorsLayer::permissive())
         .with_state(state);
     
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:4000")
         .await
         .unwrap();
     
-    info!("RSQueue server running on http://0.0.0.0:3000");
+    info!("RSQueue server running on http://0.0.0.0:4000");
     
     axum::serve(listener, app).await.unwrap();
 }
