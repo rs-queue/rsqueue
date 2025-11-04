@@ -5,7 +5,7 @@ use axum::{
     middleware,
 };
 use axum::extract::{Path, State, Request};
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use base64::Engine;
 use chrono::{DateTime, Utc};
@@ -266,6 +266,11 @@ async fn basic_auth_middleware(
     request: Request,
     next: Next,
 ) -> Response {
+    // Allow OPTIONS requests without authentication (for CORS preflight)
+    if request.method() == Method::OPTIONS {
+        return next.run(request).await;
+    }
+
     let auth_header = request
         .headers()
         .get("Authorization")
