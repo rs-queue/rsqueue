@@ -4,7 +4,7 @@ FROM rust:1.88 AS builder
 WORKDIR /app
 
 # Copy manifests
-COPY cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock ./
 
 # Copy source code
 COPY src ./src
