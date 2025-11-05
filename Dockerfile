@@ -4,7 +4,7 @@ FROM rust:1.88 AS builder
 WORKDIR /app
 
 # Copy manifests
-COPY Cargo.toml Cargo.lock ./
+COPY cargo.toml Cargo.lock ./
 
 # Copy source code
 COPY src ./src
@@ -36,7 +36,9 @@ USER app
 # Optional environment variables for Basic Authentication
 # Set both AUTH_USER and AUTH_PASSWORD to enable authentication
 # Example: docker run -e AUTH_USER=admin -e AUTH_PASSWORD=secret123 rsqueue
+# hadolint ignore=DL3002
 ENV AUTH_USER=""
+# hadolint ignore=DL3002
 ENV AUTH_PASSWORD=""
 
 EXPOSE 4000
