@@ -284,14 +284,27 @@ impl Queue {
     pub fn size(&self) -> usize {
         self.messages.len() + self.in_flight.len()
     }
-    
+
+    pub fn total_bytes(&self) -> usize {
+        // Calculate total bytes from all messages in queue (pending + in-flight)
+        let pending_bytes: usize = self.messages.iter()
+            .map(|msg| msg.content.len())
+            .sum();
+
+        let in_flight_bytes: usize = self.in_flight.values()
+            .map(|msg| msg.content.len())
+            .sum();
+
+        pending_bytes + in_flight_bytes
+    }
+
     // Thread-safe visibility check for monitoring
     pub fn get_visible_count(&self) -> usize {
         let now = Utc::now();
         let expired_count = self.in_flight.values()
             .filter(|msg| msg.visible_after.map(|va| va <= now).unwrap_or(false))
             .count();
-        
+
         self.messages.len() + expired_count
     }
 
@@ -381,6 +394,7 @@ impl Queue {
         QueueDetailInfo {
             name: queue_name.to_string(),
             size: self.size(),
+            total_bytes: self.total_bytes(),
             created_at: self.spec.created_at,
             visibility_timeout_seconds: self.spec.visibility_timeout_seconds,
             enable_deduplication: self.spec.enable_deduplication,
@@ -598,6 +612,7 @@ pub enum MessageStatus {
 pub struct QueueDetailInfo {
     pub name: String,
     pub size: usize,
+    pub total_bytes: usize,
     pub created_at: DateTime<Utc>,
     pub visibility_timeout_seconds: u64,
     pub enable_deduplication: bool,
@@ -617,6 +632,7 @@ pub fn default_count() -> usize {
 pub struct QueueInfo {
     pub name: String,
     pub size: usize,
+    pub total_bytes: usize,
     pub created_at: DateTime<Utc>,
     pub visibility_timeout_seconds: u64,
     pub enable_deduplication: bool,
@@ -753,6 +769,7 @@ pub async fn list_queues(State(state): State<AppState>) -> Json<Vec<QueueInfo>> 
         .map(|(name, queue)| QueueInfo {
             name: name.clone(),
             size: queue.size(),
+            total_bytes: queue.total_bytes(),
             created_at: queue.spec.created_at,
             visibility_timeout_seconds: queue.spec.visibility_timeout_seconds,
             enable_deduplication: queue.spec.enable_deduplication,
