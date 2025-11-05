@@ -87,6 +87,7 @@ struct QueueMetrics {
         CreateQueueRequest,
         UpdateQueueRequest,
         EnqueueRequest,
+        BatchMessageRequest,
         BatchEnqueueRequest,
         EnqueueResponse,
         BatchEnqueueResponse,

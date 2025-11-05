@@ -113,6 +113,8 @@ pub struct Message {
     pub receipt_handle: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visible_after: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>, // TTL - message expires and is deleted at this time
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -161,24 +163,68 @@ impl Queue {
         self.dedup_hashes.retain(|_, expiry| *expiry > now);
     }
 
-    pub fn enqueue(&mut self, content: String) -> Result<Uuid, String> {
+    // Remove messages that have exceeded their TTL
+    fn clean_expired_messages(&mut self) {
+        let now = Utc::now();
+        let initial_count = self.messages.len();
+
+        // Remove expired messages from the main queue
+        self.messages.retain(|msg| {
+            if let Some(expires_at) = msg.expires_at {
+                expires_at > now
+            } else {
+                true // Messages without TTL never expire
+            }
+        });
+
+        // Remove expired messages from in-flight
+        let expired_in_flight: Vec<Uuid> = self.in_flight
+            .iter()
+            .filter_map(|(handle, msg)| {
+                if let Some(expires_at) = msg.expires_at {
+                    if expires_at <= now {
+                        Some(*handle)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for handle in expired_in_flight {
+            self.in_flight.remove(&handle);
+        }
+
+        // Track how many messages were removed
+        let removed_count = initial_count - self.messages.len();
+        if removed_count > 0 {
+            info!("Removed {} expired messages from queue {}", removed_count, self.spec.name);
+        }
+    }
+
+    pub fn enqueue(&mut self, content: String, ttl_seconds: Option<u64>) -> Result<Uuid, String> {
         let _timer = OPERATION_DURATION.start_timer();
         let content_hash = Self::compute_content_hash(&content);
-        
+
         // Check for deduplication if enabled
         if self.spec.enable_deduplication {
             self.clean_expired_dedup_hashes();
-            
+
             if self.dedup_hashes.contains_key(&content_hash) {
                 DUPLICATE_MESSAGES_REJECTED_TOTAL.inc();
                 return Err(format!("Duplicate message detected (hash: {})", &content_hash[..8]));
             }
-            
+
             // Add hash with expiry time
             let expiry = Utc::now() + Duration::seconds(self.spec.deduplication_window_seconds as i64);
             self.dedup_hashes.insert(content_hash.clone(), expiry);
         }
-        
+
+        // Calculate expiration time if TTL is specified
+        let expires_at = ttl_seconds.map(|ttl| Utc::now() + Duration::seconds(ttl as i64));
+
         let message = Message {
             id: Uuid::new_v4(),
             content,
@@ -186,6 +232,7 @@ impl Queue {
             created_at: Utc::now(),
             receipt_handle: None,
             visible_after: None,
+            expires_at,
         };
         let id = message.id;
         self.messages.push_back(message);
@@ -193,9 +240,9 @@ impl Queue {
         Ok(id)
     }
 
-    pub fn enqueue_batch(&mut self, contents: Vec<String>) -> Vec<Result<Uuid, String>> {
-        contents.into_iter()
-            .map(|content| self.enqueue(content))
+    pub fn enqueue_batch(&mut self, messages: Vec<BatchMessageRequest>) -> Vec<Result<Uuid, String>> {
+        messages.into_iter()
+            .map(|msg| self.enqueue(msg.content, msg.ttl_seconds))
             .collect()
     }
 
@@ -203,8 +250,9 @@ impl Queue {
         let _timer = OPERATION_DURATION.start_timer();
         let now = Utc::now();
         let visibility_timeout = Duration::seconds(self.spec.visibility_timeout_seconds as i64);
-        
-        // Clean expired dedup hashes periodically
+
+        // Clean expired messages and dedup hashes periodically
+        self.clean_expired_messages();
         if self.spec.enable_deduplication {
             self.clean_expired_dedup_hashes();
         }
@@ -327,6 +375,7 @@ impl Queue {
                 created_at: msg.created_at,
                 status: MessageStatus::Pending,
                 visible_after: None,
+                expires_at: msg.expires_at,
             })
             .collect();
         
@@ -351,6 +400,7 @@ impl Queue {
                     created_at: msg.created_at,
                     status: MessageStatus::InFlight,
                     visible_after: msg.visible_after,
+                    expires_at: msg.expires_at,
                 })
                 .collect();
             
@@ -362,7 +412,7 @@ impl Queue {
 
     pub fn list_all_messages(&self) -> Vec<MessagePreview> {
         let mut result = Vec::new();
-        
+
         // Add all pending messages
         for msg in &self.messages {
             result.push(MessagePreview {
@@ -371,9 +421,10 @@ impl Queue {
                 created_at: msg.created_at,
                 status: MessageStatus::Pending,
                 visible_after: None,
+                expires_at: msg.expires_at,
             });
         }
-        
+
         // Add all in-flight messages
         for msg in self.in_flight.values() {
             result.push(MessagePreview {
@@ -382,9 +433,10 @@ impl Queue {
                 created_at: msg.created_at,
                 status: MessageStatus::InFlight,
                 visible_after: msg.visible_after,
+                expires_at: msg.expires_at,
             });
         }
-        
+
         // Sort by creation time
         result.sort_by(|a, b| a.created_at.cmp(&b.created_at));
         result
@@ -556,11 +608,20 @@ pub fn default_deduplication_window() -> u64 {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct EnqueueRequest {
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u64>, // Optional TTL in seconds - message will be deleted after this time
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BatchMessageRequest {
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct BatchEnqueueRequest {
-    pub messages: Vec<String>,
+    pub messages: Vec<BatchMessageRequest>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -598,6 +659,8 @@ pub struct MessagePreview {
     pub created_at: DateTime<Utc>,
     pub status: MessageStatus,
     pub visible_after: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -839,13 +902,13 @@ pub async fn enqueue_message(
     let mut queues = state.queues.write().await;
     
     if let Some(queue) = queues.get_mut(&queue_name) {
-        match queue.enqueue(req.content) {
+        match queue.enqueue(req.content, req.ttl_seconds) {
             Ok(id) => Ok(Json(EnqueueResponse { id, error: None })),
             Err(e) => {
                 warn!("Failed to enqueue message: {}", e);
-                Ok(Json(EnqueueResponse { 
-                    id: Uuid::nil(), 
-                    error: Some(e) 
+                Ok(Json(EnqueueResponse {
+                    id: Uuid::nil(),
+                    error: Some(e)
                 }))
             }
         }
@@ -1141,5 +1204,211 @@ pub async fn list_all_messages(
         Ok(Json(messages))
     } else {
         Err(StatusCode::NOT_FOUND)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration as StdDuration;
+    use tokio::time::sleep;
+
+    #[test]
+    fn test_message_ttl() {
+        let mut queue = Queue::new(
+            "test_queue".to_string(),
+            30,
+            false,
+            300,
+        );
+
+        // Test message without TTL (should not expire)
+        let id1 = queue.enqueue("Message without TTL".to_string(), None).unwrap();
+
+        // Test message with TTL of 5 seconds
+        let id2 = queue.enqueue("Message with 5s TTL".to_string(), Some(5)).unwrap();
+
+        // Test message with TTL of 1 hour
+        let id3 = queue.enqueue("Message with 1hr TTL".to_string(), Some(3600)).unwrap();
+
+        // Check all messages are present initially
+        assert_eq!(queue.messages.len(), 3);
+
+        // Verify TTL is set correctly
+        let msg_no_ttl = queue.messages.iter().find(|m| m.id == id1).unwrap();
+        assert!(msg_no_ttl.expires_at.is_none());
+
+        let msg_5s_ttl = queue.messages.iter().find(|m| m.id == id2).unwrap();
+        assert!(msg_5s_ttl.expires_at.is_some());
+
+        let msg_1hr_ttl = queue.messages.iter().find(|m| m.id == id3).unwrap();
+        assert!(msg_1hr_ttl.expires_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_ttl_expiration() {
+        let mut queue = Queue::new(
+            "test_queue".to_string(),
+            30,
+            false,
+            300,
+        );
+
+        // Add a message with a very short TTL (1 second)
+        let _expired_id = queue.enqueue("Should expire".to_string(), Some(1)).unwrap();
+
+        // Add a message without TTL
+        let _persistent_id = queue.enqueue("Should persist".to_string(), None).unwrap();
+
+        // Add a message with longer TTL
+        let _long_ttl_id = queue.enqueue("Should also persist".to_string(), Some(60)).unwrap();
+
+        assert_eq!(queue.messages.len(), 3);
+
+        // Sleep for 2 seconds to let the first message expire
+        sleep(StdDuration::from_secs(2)).await;
+
+        // Clean expired messages
+        queue.clean_expired_messages();
+
+        // Should have 2 messages left (the expired one should be removed)
+        assert_eq!(queue.messages.len(), 2);
+
+        // Verify the correct messages remain
+        let remaining_contents: Vec<String> = queue.messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+
+        assert!(remaining_contents.contains(&"Should persist".to_string()));
+        assert!(remaining_contents.contains(&"Should also persist".to_string()));
+        assert!(!remaining_contents.contains(&"Should expire".to_string()));
+    }
+
+    #[test]
+    fn test_batch_enqueue_with_ttl() {
+        let mut queue = Queue::new(
+            "test_queue".to_string(),
+            30,
+            false,
+            300,
+        );
+
+        let batch = vec![
+            BatchMessageRequest {
+                content: "Message 1".to_string(),
+                ttl_seconds: Some(10),
+            },
+            BatchMessageRequest {
+                content: "Message 2".to_string(),
+                ttl_seconds: None,
+            },
+            BatchMessageRequest {
+                content: "Message 3".to_string(),
+                ttl_seconds: Some(3600),
+            },
+        ];
+
+        let results = queue.enqueue_batch(batch);
+
+        // All messages should be enqueued successfully
+        assert_eq!(results.len(), 3);
+        for result in &results {
+            assert!(result.is_ok());
+        }
+
+        // Verify TTL settings
+        assert_eq!(queue.messages.len(), 3);
+
+        let msg1 = queue.messages.iter().find(|m| m.content == "Message 1").unwrap();
+        assert!(msg1.expires_at.is_some());
+
+        let msg2 = queue.messages.iter().find(|m| m.content == "Message 2").unwrap();
+        assert!(msg2.expires_at.is_none());
+
+        let msg3 = queue.messages.iter().find(|m| m.content == "Message 3").unwrap();
+        assert!(msg3.expires_at.is_some());
+    }
+
+    #[test]
+    fn test_dequeue_cleans_expired_messages() {
+        let mut queue = Queue::new(
+            "test_queue".to_string(),
+            30,
+            false,
+            300,
+        );
+
+        // Create a message that has already expired
+        let mut expired_msg = Message {
+            id: Uuid::new_v4(),
+            content: "Already expired".to_string(),
+            content_hash: Queue::compute_content_hash("Already expired"),
+            created_at: Utc::now() - Duration::seconds(100),
+            receipt_handle: None,
+            visible_after: None,
+            expires_at: Some(Utc::now() - Duration::seconds(10)), // Expired 10 seconds ago
+        };
+
+        // Create a valid message
+        let valid_msg = Message {
+            id: Uuid::new_v4(),
+            content: "Valid message".to_string(),
+            content_hash: Queue::compute_content_hash("Valid message"),
+            created_at: Utc::now(),
+            receipt_handle: None,
+            visible_after: None,
+            expires_at: Some(Utc::now() + Duration::seconds(100)), // Expires in 100 seconds
+        };
+
+        queue.messages.push_back(expired_msg.clone());
+        queue.messages.push_back(valid_msg.clone());
+
+        // Also test in-flight expired message
+        let receipt = Uuid::new_v4();
+        expired_msg.receipt_handle = Some(receipt);
+        queue.in_flight.insert(receipt, expired_msg);
+
+        assert_eq!(queue.messages.len(), 2);
+        assert_eq!(queue.in_flight.len(), 1);
+
+        // Dequeue should clean expired messages
+        let dequeued = queue.dequeue(10);
+
+        // Should only get the valid message
+        assert_eq!(dequeued.len(), 1);
+        assert_eq!(dequeued[0].content, "Valid message");
+
+        // Expired message should be removed from in-flight
+        assert_eq!(queue.in_flight.len(), 1); // The valid message is now in-flight
+    }
+
+    #[test]
+    fn test_message_preview_includes_ttl() {
+        let mut queue = Queue::new(
+            "test_queue".to_string(),
+            30,
+            false,
+            300,
+        );
+
+        let _id1 = queue.enqueue("Message with TTL".to_string(), Some(60)).unwrap();
+        let _id2 = queue.enqueue("Message without TTL".to_string(), None).unwrap();
+
+        let previews = queue.peek_messages(10, 0);
+        assert_eq!(previews.len(), 2);
+
+        let preview_with_ttl = previews.iter().find(|p| p.content == "Message with TTL").unwrap();
+        assert!(preview_with_ttl.expires_at.is_some());
+
+        let preview_without_ttl = previews.iter().find(|p| p.content == "Message without TTL").unwrap();
+        assert!(preview_without_ttl.expires_at.is_none());
+
+        // Test list_all_messages also includes TTL
+        let all_messages = queue.list_all_messages();
+        assert_eq!(all_messages.len(), 2);
+
+        let msg_with_ttl = all_messages.iter().find(|m| m.content == "Message with TTL").unwrap();
+        assert!(msg_with_ttl.expires_at.is_some());
     }
 }

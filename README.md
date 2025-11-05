@@ -8,9 +8,10 @@ A high-performance, thread-safe message queue service written in Rust with HTTP 
 - 🔒 **Thread-Safe**: Fully atomic operations using RwLock for concurrent access
 - ⏱️ **Visibility Timeout**: Messages become invisible to other consumers for a configurable duration
 - 🔁 **Message Deduplication**: Optional content-based deduplication using SHA-256 hashing
+- ⏳ **Message TTL (Time To Live)**: Optional message expiration - messages automatically deleted after specified time
 - 📝 **Persistent Queue Specs**: Queue configurations survive server restarts
 - 🔄 **Automatic Re-queueing**: Unprocessed messages automatically return to the queue
-- 📦 **Batch Operations**: Enqueue multiple messages in a single request
+- 📦 **Batch Operations**: Enqueue multiple messages in a single request with individual TTL settings
 - 🆔 **UUID Tracking**: Unique IDs for messages and receipt handles for secure deletion
 - 🗑️ **Queue Management**: Create, delete, list, and purge queues via API
 
@@ -67,10 +68,19 @@ curl -X POST http://localhost:3000/queues \
 ### 2. Send a Message
 
 ```bash
+# Basic message
 curl -X POST http://localhost:3000/queues/task-queue/messages \
   -H "Content-Type: application/json" \
   -d '{
     "content": "Process order #12345"
+  }'
+
+# Message with TTL (expires in 5 minutes)
+curl -X POST http://localhost:3000/queues/task-queue/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "content": "Temporary task",
+    "ttl_seconds": 300
   }'
 ```
 
@@ -138,7 +148,8 @@ curl -X DELETE http://localhost:3000/queues/task-queue/messages/650e8400-e29b-41
 - **Body**:
   ```json
   {
-    "content": "string"
+    "content": "string",
+    "ttl_seconds": 300  // optional, message expires after this many seconds
   }
   ```
 - **Returns**: `{"id": "uuid"}`
@@ -148,10 +159,25 @@ curl -X DELETE http://localhost:3000/queues/task-queue/messages/650e8400-e29b-41
 - **Body**:
   ```json
   {
-    "messages": ["message1", "message2", "message3"]
+    "messages": [
+      {"content": "message1", "ttl_seconds": 60},
+      {"content": "message2", "ttl_seconds": null},
+      {"content": "message3", "ttl_seconds": 300}
+    ]
   }
   ```
-- **Returns**: `{"ids": ["uuid1", "uuid2", "uuid3"]}`
+- **Returns**:
+  ```json
+  {
+    "results": [
+      {"id": "uuid1", "error": null},
+      {"id": "uuid2", "error": null},
+      {"id": "uuid3", "error": null}
+    ],
+    "successful": 3,
+    "failed": 0
+  }
+  ```
 
 #### Receive Messages
 - **POST** `/queues/{queue_name}/messages/get`
@@ -191,11 +217,12 @@ RSQueue uses Rust's `tokio::sync::RwLock` to ensure all operations are thread-sa
 
 ### Message Lifecycle
 
-1. **Enqueued**: Message added to queue, receives unique ID
+1. **Enqueued**: Message added to queue, receives unique ID and optional TTL
 2. **Available**: Message visible and ready for processing
 3. **In-Flight**: Message retrieved by consumer, invisible to others
 4. **Deleted**: Message successfully processed and removed
 5. **Re-queued**: Message returns to Available if not deleted within visibility timeout
+6. **Expired**: Message with TTL automatically deleted after expiration time (regardless of state)
 
 ### Visibility Timeout
 
