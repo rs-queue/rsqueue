@@ -9,11 +9,14 @@ A high-performance, thread-safe message queue service written in Rust with HTTP 
 - ⏱️ **Visibility Timeout**: Messages become invisible to other consumers for a configurable duration
 - 🔁 **Message Deduplication**: Optional content-based deduplication using SHA-256 hashing
 - ⏳ **Message TTL (Time To Live)**: Optional message expiration - messages automatically deleted after specified time
+- ⏰ **Delayed/Scheduled Messages**: Schedule messages for future delivery with delay_seconds parameter
 - 📝 **Persistent Queue Specs**: Queue configurations survive server restarts
 - 🔄 **Automatic Re-queueing**: Unprocessed messages automatically return to the queue
-- 📦 **Batch Operations**: Enqueue multiple messages in a single request with individual TTL settings
+- 📦 **Batch Operations**: Enqueue and delete multiple messages in a single request
 - 🆔 **UUID Tracking**: Unique IDs for messages and receipt handles for secure deletion
 - 🗑️ **Queue Management**: Create, delete, list, and purge queues via API
+- 📊 **Queue Statistics**: Track message age, throughput, and performance metrics
+- 🖥️ **CLI Tool**: Command-line interface for all queue operations
 
 ## Installation
 
@@ -36,7 +39,17 @@ cargo build --release
 cargo run --release
 ```
 
-The server will start on `http://0.0.0.0:3000`
+The server will start on `http://0.0.0.0:4000`
+
+### CLI Tool
+
+```bash
+# Build and install the CLI tool
+cargo install --path . --bin rsqueue-cli
+
+# Or run directly
+cargo run --bin rsqueue-cli -- --help
+```
 
 ## Quick Start
 
@@ -69,29 +82,44 @@ curl -X POST http://localhost:3000/queues \
 
 ```bash
 # Basic message
-curl -X POST http://localhost:3000/queues/task-queue/messages \
+curl -X POST http://localhost:4000/queues/task-queue/messages \
   -H "Content-Type: application/json" \
   -d '{
     "content": "Process order #12345"
   }'
 
 # Message with TTL (expires in 5 minutes)
-curl -X POST http://localhost:3000/queues/task-queue/messages \
+curl -X POST http://localhost:4000/queues/task-queue/messages \
   -H "Content-Type: application/json" \
   -d '{
     "content": "Temporary task",
     "ttl_seconds": 300
   }'
+
+# Scheduled/delayed message (delivered in 60 seconds)
+curl -X POST http://localhost:4000/queues/task-queue/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "content": "Future task",
+    "delay_seconds": 60
+  }'
+
+# Or use the CLI tool
+rsqueue-cli send task-queue "Process order #12345"
+rsqueue-cli send task-queue "Delayed task" --delay 60 --ttl 300
 ```
 
 ### 3. Receive Messages
 
 ```bash
-curl -X POST http://localhost:3000/queues/task-queue/messages/get \
+curl -X POST http://localhost:4000/queues/task-queue/messages/get \
   -H "Content-Type: application/json" \
   -d '{
     "count": 1
   }'
+
+# Or use the CLI tool
+rsqueue-cli receive task-queue --count 5
 ```
 
 Response:
@@ -110,7 +138,10 @@ Response:
 ### 4. Delete a Message
 
 ```bash
-curl -X DELETE http://localhost:3000/queues/task-queue/messages/650e8400-e29b-41d4-a716-446655440001
+curl -X DELETE http://localhost:4000/queues/task-queue/messages/650e8400-e29b-41d4-a716-446655440001
+
+# Or use the CLI tool
+rsqueue-cli delete-message task-queue 650e8400-e29b-41d4-a716-446655440001
 ```
 
 ## API Reference
@@ -194,17 +225,80 @@ curl -X DELETE http://localhost:3000/queues/task-queue/messages/650e8400-e29b-41
 - **Description**: Confirms message processing and removes it from the queue
 - **Returns**: 204 No Content on success
 
+#### Batch Delete Messages
+- **POST** `/queues/{queue_name}/messages/batch-delete`
+- **Body**:
+  ```json
+  {
+    "receipt_handles": ["uuid1", "uuid2", "uuid3"]
+  }
+  ```
+- **Returns**: Batch delete results with success/failure for each message
+
 ## Configuration
 
 ### Queue Settings
 
 - **`visibility_timeout_seconds`**: Duration (in seconds) that a message remains invisible after being retrieved. Default: 120 seconds (2 minutes)
+- **`enable_deduplication`**: Enable content-based message deduplication. Default: false
+- **`deduplication_window_seconds`**: How long to remember message hashes for deduplication. Default: 300 seconds (5 minutes)
+
+### Message Options
+
+- **`ttl_seconds`**: Message expiration time in seconds (optional)
+- **`delay_seconds`**: Delay before message becomes available for delivery (optional)
 
 ### Storage
 
 - Queue specifications are stored in `./queue_specs/` as JSON files
 - Messages are kept in memory for maximum performance
 - Queue configurations persist across server restarts
+
+## CLI Tool Usage
+
+The rsqueue-cli tool provides a convenient command-line interface:
+
+```bash
+# Create a queue
+rsqueue-cli create my-queue --visibility-timeout 120 --dedup
+
+# List all queues
+rsqueue-cli list
+
+# Send a message
+rsqueue-cli send my-queue "Hello World" --ttl 300 --delay 60
+
+# Receive messages
+rsqueue-cli receive my-queue --count 10
+
+# Delete a message
+rsqueue-cli delete-message my-queue <receipt-handle>
+
+# Get queue details and statistics
+rsqueue-cli details my-queue
+rsqueue-cli metrics my-queue
+
+# Peek at messages without removing them
+rsqueue-cli peek my-queue --count 5
+
+# Delete a queue
+rsqueue-cli delete my-queue
+
+# Purge all messages
+rsqueue-cli purge my-queue
+```
+
+### Environment Variables
+
+The CLI tool supports configuration via environment variables:
+
+```bash
+export RSQUEUE_URL=http://localhost:4000
+export RSQUEUE_USER=admin
+export RSQUEUE_PASSWORD=secret
+
+rsqueue-cli list
+```
 
 ## Architecture
 
@@ -239,25 +333,21 @@ When a consumer retrieves a message:
 ```bash
 # Producer adds tasks
 for i in {1..100}; do
-  curl -X POST http://localhost:3000/queues/jobs/messages \
-    -H "Content-Type: application/json" \
-    -d "{\"content\": \"Job $i\"}"
+  rsqueue-cli send jobs "Job $i"
 done
 
 # Multiple workers consume tasks
 while true; do
-  RESPONSE=$(curl -s -X POST http://localhost:3000/queues/jobs/messages/get \
-    -H "Content-Type: application/json" \
-    -d '{"count": 1}')
-  
+  RESPONSE=$(rsqueue-cli receive jobs --count 1)
+
   # Process message and delete if successful
   RECEIPT=$(echo $RESPONSE | jq -r '.[0].receipt_handle')
   if [ "$RECEIPT" != "null" ]; then
     # Process the job here
     echo "Processing: $(echo $RESPONSE | jq -r '.[0].content')"
-    
+
     # Delete on success
-    curl -X DELETE http://localhost:3000/queues/jobs/messages/$RECEIPT
+    rsqueue-cli delete-message jobs $RECEIPT
   else
     sleep 1
   fi
@@ -268,20 +358,18 @@ done
 
 ```bash
 # Send multiple messages at once
-curl -X POST http://localhost:3000/queues/notifications/messages/batch \
+curl -X POST http://localhost:4000/queues/notifications/messages/batch \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [
-      "Send email to user1@example.com",
-      "Send SMS to +1234567890",
-      "Push notification to device_token_xyz"
+      {"content": "Send email to user1@example.com"},
+      {"content": "Send SMS to +1234567890", "ttl_seconds": 300},
+      {"content": "Push notification to device_token_xyz", "delay_seconds": 60}
     ]
   }'
 
 # Retrieve and process in batches
-curl -X POST http://localhost:3000/queues/notifications/messages/get \
-  -H "Content-Type: application/json" \
-  -d '{"count": 10}'
+rsqueue-cli receive notifications --count 10
 ```
 
 ## Performance Considerations
@@ -317,7 +405,7 @@ RUN cargo build --release
 FROM debian:bookworm-slim
 WORKDIR /app
 COPY --from=builder /app/target/release/rsqueue .
-EXPOSE 3000
+EXPOSE 4000
 CMD ["./rsqueue"]
 ```
 
@@ -331,16 +419,19 @@ MIT License - feel free to use this in your projects!
 
 ## Roadmap
 
-- [ ] Add message TTL (time-to-live)
+- [x] Add message TTL (time-to-live)
+- [x] Message deduplication
+- [x] Scheduled/delayed message delivery
+- [x] Add metrics and monitoring endpoints
+- [x] CLI tool for queue operations
+- [x] Batch delete operations
+- [x] Queue statistics and performance tracking
 - [ ] Implement message priorities
 - [ ] Add dead letter queue support
 - [ ] Create distributed version with clustering
 - [ ] Add message compression
 - [ ] Implement persistence options (RocksDB, PostgreSQL)
-- [ ] Add metrics and monitoring endpoints
 - [ ] WebSocket support for real-time message streaming
-- [ ] Message deduplication
-- [ ] Scheduled message delivery
 
 ## Support
 
