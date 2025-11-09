@@ -20,9 +20,10 @@ prometheus = "0.13"
 lazy_static = "1.4"
 utoipa = { version = "4", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "4", features = ["axum"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+reqwest = { version = "0.11", features = ["json", "blocking"] }
 
 [dev-dependencies]
 axum-test = "14.0"
-reqwest = { version = "0.11", features = ["json"] }
 tempfile = "3.8"
 

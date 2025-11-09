@@ -57,6 +57,10 @@ struct QueueMetrics {
     created_at: DateTime<Utc>,
     visibility_timeout_seconds: u64,
     enable_deduplication: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oldest_message_age_seconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    average_message_age_seconds: Option<f64>,
 }
 
 #[derive(OpenApi)]
@@ -74,6 +78,7 @@ struct QueueMetrics {
         enqueue_batch,
         get_messages,
         delete_message,
+        batch_delete_messages,
         peek_messages,
         get_queue_details,
         list_all_messages
@@ -96,7 +101,10 @@ struct QueueMetrics {
         PeekMessagesRequest,
         MessagePreview,
         MessageStatus,
-        QueueDetailInfo
+        QueueDetailInfo,
+        BatchDeleteRequest,
+        BatchDeleteResponse,
+        DeleteResult
     )),
     tags(
         (name = "health", description = "Health check and monitoring endpoints"),
@@ -208,6 +216,7 @@ async fn get_queue_metrics(
 ) -> Result<Json<QueueMetrics>, StatusCode> {
     let queues = state.queues.read().await;
     if let Some(queue) = queues.get(&queue_name) {
+        let detail_info = queue.get_detailed_info(&queue_name);
         Ok(Json(QueueMetrics {
             name: queue_name,
             messages_pending: queue.messages.len(),
@@ -219,6 +228,8 @@ async fn get_queue_metrics(
             created_at: queue.spec.created_at,
             visibility_timeout_seconds: queue.spec.visibility_timeout_seconds,
             enable_deduplication: queue.spec.enable_deduplication,
+            oldest_message_age_seconds: detail_info.oldest_message_age_seconds,
+            average_message_age_seconds: detail_info.average_message_age_seconds,
         }))
     } else {
         Err(StatusCode::NOT_FOUND)
@@ -327,6 +338,7 @@ async fn main() {
         .route("/queues/:name/messages/peek", post(peek_messages))
         .route("/queues/:name/messages/all", get(list_all_messages))
         .route("/queues/:name/messages/:receipt_handle", delete(delete_message))
+        .route("/queues/:name/messages/batch-delete", post(batch_delete_messages))
 
         // Queue details
         .route("/queues/:name/details", get(get_queue_details))
