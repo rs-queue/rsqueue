@@ -1,0 +1,875 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RSQueue Dashboard - Real-time Monitoring</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #0f1419;
+            color: #e7e9ea;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            background: #1e2732;
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        h1 {
+            font-size: 24px;
+            color: #1d9bf0;
+        }
+
+        .connection-status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+        }
+
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #71767b;
+        }
+
+        .status-indicator.connected {
+            background: #00ba7c;
+            box-shadow: 0 0 10px #00ba7c;
+        }
+
+        .status-indicator.disconnected {
+            background: #f4212e;
+            box-shadow: 0 0 10px #f4212e;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+
+        .card {
+            background: #1e2732;
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid #2f3336;
+        }
+
+        .card h2 {
+            font-size: 16px;
+            color: #71767b;
+            margin-bottom: 15px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .metric {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 0;
+            border-bottom: 1px solid #2f3336;
+        }
+
+        .metric:last-child {
+            border-bottom: none;
+        }
+
+        .metric-label {
+            color: #71767b;
+        }
+
+        .metric-value {
+            font-size: 24px;
+            font-weight: 600;
+            color: #1d9bf0;
+        }
+
+        .metric-value.warning {
+            color: #ffad1f;
+        }
+
+        .metric-value.danger {
+            color: #f4212e;
+        }
+
+        .metric-value.success {
+            color: #00ba7c;
+        }
+
+        .events-panel {
+            background: #1e2732;
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid #2f3336;
+            height: 400px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .events-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+
+        .events-list {
+            flex: 1;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+        }
+
+        .event-item {
+            padding: 8px 12px;
+            border-radius: 6px;
+            margin-bottom: 6px;
+            background: #0f1419;
+            border-left: 3px solid #71767b;
+            animation: slideIn 0.3s ease;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateX(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+
+        .event-item.enqueue {
+            border-left-color: #00ba7c;
+        }
+
+        .event-item.dequeue {
+            border-left-color: #1d9bf0;
+        }
+
+        .event-item.delete {
+            border-left-color: #f4212e;
+        }
+
+        .event-item.queue {
+            border-left-color: #ffad1f;
+        }
+
+        .event-time {
+            color: #71767b;
+            font-size: 11px;
+        }
+
+        .event-type {
+            font-weight: 600;
+            margin-right: 8px;
+        }
+
+        .queues-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 15px;
+        }
+
+        .queue-card {
+            background: #0f1419;
+            border-radius: 8px;
+            padding: 15px;
+            border: 1px solid #2f3336;
+            transition: all 0.3s ease;
+        }
+
+        .queue-card:hover {
+            border-color: #1d9bf0;
+            transform: translateY(-2px);
+        }
+
+        .queue-card.updated {
+            animation: pulse 0.5s ease;
+        }
+
+        @keyframes pulse {
+            0%, 100% {
+                box-shadow: none;
+            }
+            50% {
+                box-shadow: 0 0 20px rgba(29, 155, 240, 0.3);
+            }
+        }
+
+        .queue-name {
+            font-size: 16px;
+            font-weight: 600;
+            color: #e7e9ea;
+            margin-bottom: 10px;
+        }
+
+        .queue-stats {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+
+        .queue-stat {
+            background: #1e2732;
+            padding: 8px;
+            border-radius: 6px;
+            text-align: center;
+        }
+
+        .queue-stat-value {
+            font-size: 18px;
+            font-weight: 600;
+            color: #1d9bf0;
+        }
+
+        .queue-stat-label {
+            font-size: 11px;
+            color: #71767b;
+            text-transform: uppercase;
+        }
+
+        .flow-visualization {
+            background: #1e2732;
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid #2f3336;
+            margin-bottom: 20px;
+        }
+
+        .flow-chart {
+            height: 200px;
+            position: relative;
+            display: flex;
+            align-items: flex-end;
+            gap: 2px;
+            padding: 10px 0;
+        }
+
+        .flow-bar {
+            flex: 1;
+            background: #1d9bf0;
+            border-radius: 2px 2px 0 0;
+            transition: height 0.3s ease;
+            min-height: 2px;
+            position: relative;
+        }
+
+        .flow-bar:hover::after {
+            content: attr(data-value);
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #0f1419;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            white-space: nowrap;
+        }
+
+        .btn {
+            background: #1d9bf0;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background 0.3s ease;
+        }
+
+        .btn:hover {
+            background: #1a8cd8;
+        }
+
+        .btn-danger {
+            background: #f4212e;
+        }
+
+        .btn-danger:hover {
+            background: #dc1e28;
+        }
+
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        input[type="text"], input[type="number"] {
+            background: #0f1419;
+            border: 1px solid #2f3336;
+            color: #e7e9ea;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+
+        input[type="text"]:focus, input[type="number"]:focus {
+            outline: none;
+            border-color: #1d9bf0;
+        }
+
+        .no-queues {
+            text-align: center;
+            padding: 40px;
+            color: #71767b;
+        }
+
+        .notification {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: #1d9bf0;
+            color: white;
+            padding: 12px 20px;
+            border-radius: 8px;
+            animation: slideInRight 0.3s ease, fadeOut 0.3s ease 2.7s;
+            z-index: 1000;
+        }
+
+        @keyframes slideInRight {
+            from {
+                transform: translateX(100%);
+                opacity: 0;
+            }
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+
+        @keyframes fadeOut {
+            to {
+                opacity: 0;
+            }
+        }
+
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .tab {
+            padding: 10px 20px;
+            background: #1e2732;
+            border: 1px solid #2f3336;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .tab.active {
+            background: #1d9bf0;
+            border-color: #1d9bf0;
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>RSQueue Dashboard</h1>
+            <div class="connection-status">
+                <div id="statusIndicator" class="status-indicator"></div>
+                <span id="statusText">Connecting...</span>
+            </div>
+        </header>
+
+        <div class="tabs">
+            <div class="tab active" data-tab="overview">Overview</div>
+            <div class="tab" data-tab="queues">Queues</div>
+            <div class="tab" data-tab="events">Event Stream</div>
+        </div>
+
+        <!-- Overview Tab -->
+        <div id="overview" class="tab-content active">
+            <div class="grid">
+                <div class="card">
+                    <h2>Global Metrics</h2>
+                    <div class="metric">
+                        <span class="metric-label">Active Queues</span>
+                        <span id="activeQueues" class="metric-value">0</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Total Pending</span>
+                        <span id="totalPending" class="metric-value">0</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">In Flight</span>
+                        <span id="totalInFlight" class="metric-value">0</span>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>Event Statistics</h2>
+                    <div class="metric">
+                        <span class="metric-label">Messages Enqueued</span>
+                        <span id="totalEnqueued" class="metric-value success">0</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Messages Dequeued</span>
+                        <span id="totalDequeued" class="metric-value">0</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Messages Deleted</span>
+                        <span id="totalDeleted" class="metric-value danger">0</span>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>Connection Info</h2>
+                    <div class="metric">
+                        <span class="metric-label">Events Received</span>
+                        <span id="eventsReceived" class="metric-value">0</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Last Event</span>
+                        <span id="lastEventTime" class="metric-value" style="font-size: 14px;">-</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Uptime</span>
+                        <span id="uptime" class="metric-value" style="font-size: 14px;">0s</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="flow-visualization">
+                <h2 style="color: #71767b; margin-bottom: 15px;">Message Flow (Last 60 seconds)</h2>
+                <div id="flowChart" class="flow-chart"></div>
+            </div>
+        </div>
+
+        <!-- Queues Tab -->
+        <div id="queues" class="tab-content">
+            <div class="controls">
+                <input type="text" id="newQueueName" placeholder="Queue name">
+                <button class="btn" onclick="createQueue()">Create Queue</button>
+                <button class="btn" onclick="refreshQueues()">Refresh</button>
+            </div>
+
+            <div id="queuesContainer" class="queues-grid">
+                <div class="no-queues">Loading queues...</div>
+            </div>
+        </div>
+
+        <!-- Events Tab -->
+        <div id="events" class="tab-content">
+            <div class="events-panel" style="height: calc(100vh - 250px);">
+                <div class="events-header">
+                    <h2 style="margin: 0; color: #71767b;">Live Event Stream</h2>
+                    <button class="btn btn-danger" onclick="clearEvents()">Clear</button>
+                </div>
+                <div id="eventsList" class="events-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // State management
+        const state = {
+            eventSource: null,
+            connected: false,
+            eventsReceived: 0,
+            startTime: Date.now(),
+            queues: {},
+            flowData: new Array(60).fill(0),
+            stats: {
+                enqueued: 0,
+                dequeued: 0,
+                deleted: 0
+            }
+        };
+
+        // Initialize SSE connection
+        function connectSSE() {
+            const statusIndicator = document.getElementById('statusIndicator');
+            const statusText = document.getElementById('statusText');
+
+            state.eventSource = new EventSource('/events');
+
+            state.eventSource.onopen = () => {
+                state.connected = true;
+                statusIndicator.className = 'status-indicator connected';
+                statusText.textContent = 'Connected';
+                showNotification('Connected to event stream');
+            };
+
+            state.eventSource.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                handleEvent(data);
+            };
+
+            state.eventSource.onerror = () => {
+                state.connected = false;
+                statusIndicator.className = 'status-indicator disconnected';
+                statusText.textContent = 'Disconnected - Reconnecting...';
+            };
+        }
+
+        // Handle incoming events
+        function handleEvent(event) {
+            state.eventsReceived++;
+            document.getElementById('eventsReceived').textContent = state.eventsReceived;
+            document.getElementById('lastEventTime').textContent = new Date().toLocaleTimeString();
+
+            // Add to event list
+            addEventToList(event);
+
+            // Update flow chart
+            updateFlowChart(event);
+
+            // Update statistics
+            updateStats(event);
+
+            // Update queue-specific data
+            updateQueueData(event);
+        }
+
+        function addEventToList(event) {
+            const eventsList = document.getElementById('eventsList');
+            const eventDiv = document.createElement('div');
+
+            let eventClass = '';
+            let eventText = '';
+            const time = new Date().toLocaleTimeString();
+
+            switch (event.type) {
+                case 'message_enqueued':
+                    eventClass = 'enqueue';
+                    eventText = `[${event.queue_name}] Message enqueued (depth: ${event.queue_depth})`;
+                    break;
+                case 'messages_dequeued':
+                    eventClass = 'dequeue';
+                    eventText = `[${event.queue_name}] ${event.count} message(s) dequeued (depth: ${event.queue_depth})`;
+                    break;
+                case 'message_deleted':
+                    eventClass = 'delete';
+                    eventText = `[${event.queue_name}] Message deleted (depth: ${event.queue_depth})`;
+                    break;
+                case 'batch_deleted':
+                    eventClass = 'delete';
+                    eventText = `[${event.queue_name}] Batch delete: ${event.successful} success, ${event.failed} failed`;
+                    break;
+                case 'queue_created':
+                    eventClass = 'queue';
+                    eventText = `Queue created: ${event.queue_name}`;
+                    refreshQueues();
+                    break;
+                case 'queue_deleted':
+                    eventClass = 'queue';
+                    eventText = `Queue deleted: ${event.queue_name}`;
+                    refreshQueues();
+                    break;
+                case 'queue_purged':
+                    eventClass = 'queue';
+                    eventText = `Queue purged: ${event.queue_name}`;
+                    break;
+                case 'metrics_update':
+                    document.getElementById('activeQueues').textContent = event.active_queues;
+                    document.getElementById('totalPending').textContent = event.total_pending;
+                    document.getElementById('totalInFlight').textContent = event.total_in_flight;
+                    return; // Don't add to event list
+                case 'heartbeat':
+                    return; // Don't add to event list
+                default:
+                    eventText = JSON.stringify(event);
+            }
+
+            eventDiv.className = `event-item ${eventClass}`;
+            eventDiv.innerHTML = `
+                <span class="event-time">${time}</span>
+                <span class="event-type">${event.type.toUpperCase()}</span>
+                ${eventText}
+            `;
+
+            eventsList.insertBefore(eventDiv, eventsList.firstChild);
+
+            // Keep only last 100 events
+            while (eventsList.children.length > 100) {
+                eventsList.removeChild(eventsList.lastChild);
+            }
+        }
+
+        function updateFlowChart(event) {
+            if (event.type === 'message_enqueued' || event.type === 'messages_dequeued') {
+                const count = event.count || 1;
+                state.flowData[state.flowData.length - 1] += count;
+            }
+        }
+
+        function updateStats(event) {
+            switch (event.type) {
+                case 'message_enqueued':
+                    state.stats.enqueued++;
+                    document.getElementById('totalEnqueued').textContent = state.stats.enqueued;
+                    break;
+                case 'messages_dequeued':
+                    state.stats.dequeued += event.count;
+                    document.getElementById('totalDequeued').textContent = state.stats.dequeued;
+                    break;
+                case 'message_deleted':
+                    state.stats.deleted++;
+                    document.getElementById('totalDeleted').textContent = state.stats.deleted;
+                    break;
+                case 'batch_deleted':
+                    state.stats.deleted += event.successful;
+                    document.getElementById('totalDeleted').textContent = state.stats.deleted;
+                    break;
+            }
+        }
+
+        function updateQueueData(event) {
+            const queueName = event.queue_name;
+            if (!queueName) return;
+
+            if (state.queues[queueName]) {
+                state.queues[queueName].depth = event.queue_depth || state.queues[queueName].depth;
+                renderQueues();
+
+                // Add pulse animation
+                const queueCard = document.querySelector(`[data-queue="${queueName}"]`);
+                if (queueCard) {
+                    queueCard.classList.add('updated');
+                    setTimeout(() => queueCard.classList.remove('updated'), 500);
+                }
+            }
+        }
+
+        function renderFlowChart() {
+            const chart = document.getElementById('flowChart');
+            const maxValue = Math.max(...state.flowData, 1);
+
+            chart.innerHTML = state.flowData.map((value, index) => {
+                const height = (value / maxValue) * 180;
+                return `<div class="flow-bar" style="height: ${height}px" data-value="${value} events"></div>`;
+            }).join('');
+        }
+
+        async function refreshQueues() {
+            try {
+                const response = await fetch('/queues');
+                const queues = await response.json();
+
+                state.queues = {};
+                queues.forEach(q => {
+                    state.queues[q.name] = {
+                        depth: q.size,
+                        pending: q.size,
+                        inFlight: 0,
+                        createdAt: q.created_at
+                    };
+                });
+
+                document.getElementById('activeQueues').textContent = queues.length;
+                renderQueues();
+            } catch (error) {
+                console.error('Failed to fetch queues:', error);
+            }
+        }
+
+        function renderQueues() {
+            const container = document.getElementById('queuesContainer');
+            const queueNames = Object.keys(state.queues);
+
+            if (queueNames.length === 0) {
+                container.innerHTML = '<div class="no-queues">No queues available. Create one above.</div>';
+                return;
+            }
+
+            container.innerHTML = queueNames.map(name => {
+                const queue = state.queues[name];
+                return `
+                    <div class="queue-card" data-queue="${name}">
+                        <div class="queue-name">${name}</div>
+                        <div class="queue-stats">
+                            <div class="queue-stat">
+                                <div class="queue-stat-value">${queue.depth}</div>
+                                <div class="queue-stat-label">Total</div>
+                            </div>
+                            <div class="queue-stat">
+                                <div class="queue-stat-value">${queue.pending}</div>
+                                <div class="queue-stat-label">Pending</div>
+                            </div>
+                        </div>
+                        <div style="margin-top: 10px; display: flex; gap: 8px;">
+                            <button class="btn" style="flex: 1; font-size: 12px;" onclick="sendTestMessage('${name}')">
+                                Send Message
+                            </button>
+                            <button class="btn btn-danger" style="font-size: 12px;" onclick="deleteQueue('${name}')">
+                                Delete
+                            </button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        async function createQueue() {
+            const nameInput = document.getElementById('newQueueName');
+            const name = nameInput.value.trim();
+
+            if (!name) {
+                showNotification('Please enter a queue name', 'warning');
+                return;
+            }
+
+            try {
+                const response = await fetch('/queues', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name })
+                });
+
+                if (response.ok) {
+                    nameInput.value = '';
+                    showNotification(`Queue "${name}" created`);
+                } else {
+                    showNotification('Failed to create queue', 'danger');
+                }
+            } catch (error) {
+                showNotification('Error creating queue', 'danger');
+            }
+        }
+
+        async function deleteQueue(name) {
+            if (!confirm(`Are you sure you want to delete queue "${name}"?`)) return;
+
+            try {
+                const response = await fetch(`/queues/${name}`, { method: 'DELETE' });
+                if (response.ok) {
+                    showNotification(`Queue "${name}" deleted`);
+                }
+            } catch (error) {
+                showNotification('Error deleting queue', 'danger');
+            }
+        }
+
+        async function sendTestMessage(queueName) {
+            try {
+                const response = await fetch(`/queues/${queueName}/messages`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        content: `Test message at ${new Date().toISOString()}`
+                    })
+                });
+
+                if (response.ok) {
+                    showNotification('Message sent');
+                }
+            } catch (error) {
+                showNotification('Error sending message', 'danger');
+            }
+        }
+
+        function clearEvents() {
+            document.getElementById('eventsList').innerHTML = '';
+        }
+
+        function showNotification(message, type = 'info') {
+            const notification = document.createElement('div');
+            notification.className = 'notification';
+            notification.textContent = message;
+
+            if (type === 'danger') {
+                notification.style.background = '#f4212e';
+            } else if (type === 'warning') {
+                notification.style.background = '#ffad1f';
+            }
+
+            document.body.appendChild(notification);
+            setTimeout(() => notification.remove(), 3000);
+        }
+
+        // Tab switching
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+
+                tab.classList.add('active');
+                document.getElementById(tab.dataset.tab).classList.add('active');
+            });
+        });
+
+        // Update uptime
+        setInterval(() => {
+            const seconds = Math.floor((Date.now() - state.startTime) / 1000);
+            const minutes = Math.floor(seconds / 60);
+            const hours = Math.floor(minutes / 60);
+
+            let uptimeText = '';
+            if (hours > 0) {
+                uptimeText = `${hours}h ${minutes % 60}m`;
+            } else if (minutes > 0) {
+                uptimeText = `${minutes}m ${seconds % 60}s`;
+            } else {
+                uptimeText = `${seconds}s`;
+            }
+
+            document.getElementById('uptime').textContent = uptimeText;
+        }, 1000);
+
+        // Shift flow data every second
+        setInterval(() => {
+            state.flowData.shift();
+            state.flowData.push(0);
+            renderFlowChart();
+        }, 1000);
+
+        // Fetch initial metrics
+        async function fetchInitialMetrics() {
+            try {
+                const response = await fetch('/metrics/summary');
+                const metrics = await response.json();
+                document.getElementById('activeQueues').textContent = metrics.active_queues;
+                document.getElementById('totalPending').textContent = metrics.total_messages_pending;
+                document.getElementById('totalInFlight').textContent = metrics.total_messages_in_flight;
+            } catch (error) {
+                console.error('Failed to fetch initial metrics:', error);
+            }
+        }
+
+        // Initialize
+        connectSSE();
+        refreshQueues();
+        fetchInitialMetrics();
+        renderFlowChart();
+    </script>
+</body>
+</html>

@@ -32,7 +32,7 @@ async fn test_queue_creation() {
 async fn test_enqueue_dequeue() {
     let mut queue = create_test_queue();
     
-    let id = queue.enqueue("test message".to_string(), None).unwrap();
+    let id = queue.enqueue("test message".to_string(), None, None).unwrap();
     assert_eq!(queue.size(), 1);
     
     let messages = queue.dequeue(1);
@@ -49,9 +49,9 @@ async fn test_batch_enqueue() {
     let mut queue = create_test_queue();
     
     let messages = vec![
-        BatchMessageRequest { content: "msg1".to_string(), ttl_seconds: None },
-        BatchMessageRequest { content: "msg2".to_string(), ttl_seconds: None },
-        BatchMessageRequest { content: "msg3".to_string(), ttl_seconds: None },
+        BatchMessageRequest { content: "msg1".to_string(), ttl_seconds: None, delay_seconds: None },
+        BatchMessageRequest { content: "msg2".to_string(), ttl_seconds: None, delay_seconds: None },
+        BatchMessageRequest { content: "msg3".to_string(), ttl_seconds: None, delay_seconds: None },
     ];
     let results = queue.enqueue_batch(messages);
     
@@ -64,8 +64,8 @@ async fn test_batch_enqueue() {
 async fn test_deduplication() {
     let mut queue = create_test_queue_with_dedup();
     
-    let id1 = queue.enqueue("duplicate message".to_string(), None).unwrap();
-    let result2 = queue.enqueue("duplicate message".to_string(), None);
+    let id1 = queue.enqueue("duplicate message".to_string(), None, None).unwrap();
+    let result2 = queue.enqueue("duplicate message".to_string(), None, None);
     
     assert!(result2.is_err());
     assert_eq!(queue.size(), 1);
@@ -79,7 +79,7 @@ async fn test_deduplication() {
 async fn test_message_deletion() {
     let mut queue = create_test_queue();
     
-    queue.enqueue("test message".to_string(), None).unwrap();
+    queue.enqueue("test message".to_string(), None, None).unwrap();
     let messages = queue.dequeue(1);
     let receipt_handle = messages[0].receipt_handle.unwrap();
     
@@ -94,11 +94,11 @@ async fn test_message_deletion() {
 async fn test_visibility_timeout() {
     let mut queue = Queue::new("test".to_string(), 1, false, 300); // 1 second timeout
     
-    queue.enqueue("test message".to_string(), None).unwrap();
+    queue.enqueue("test message".to_string(), None, None).unwrap();
     let messages = queue.dequeue(1);
     assert_eq!(messages.len(), 1);
     assert_eq!(queue.size(), 1); // In-flight
-    
+
     // Wait for visibility timeout
     tokio::time::sleep(StdDuration::from_secs(2)).await;
     
@@ -112,8 +112,8 @@ async fn test_visibility_timeout() {
 async fn test_queue_purge() {
     let mut queue = create_test_queue();
     
-    queue.enqueue("msg1".to_string(), None).unwrap();
-    queue.enqueue("msg2".to_string(), None).unwrap();
+    queue.enqueue("msg1".to_string(), None, None).unwrap();
+    queue.enqueue("msg2".to_string(), None, None).unwrap();
     let _messages = queue.dequeue(1);
     assert_eq!(queue.size(), 2); // 1 pending + 1 in-flight
     
@@ -125,8 +125,8 @@ async fn test_queue_purge() {
 async fn test_visible_count() {
     let mut queue = Queue::new("test".to_string(), 1, false, 300);
     
-    queue.enqueue("msg1".to_string(), None).unwrap();
-    queue.enqueue("msg2".to_string(), None).unwrap();
+    queue.enqueue("msg1".to_string(), None, None).unwrap();
+    queue.enqueue("msg2".to_string(), None, None).unwrap();
     assert_eq!(queue.get_visible_count(), 2);
     
     queue.dequeue(1);
@@ -227,13 +227,14 @@ async fn test_enqueue_message_endpoint() {
     let enqueue_request = EnqueueRequest {
         content: "test message".to_string(),
         ttl_seconds: None,
+        delay_seconds: None,
     };
-    
+
     let response = server
         .post("/queues/test_queue/messages")
         .json(&enqueue_request)
         .await;
-    
+
     response.assert_status_ok();
     let result: EnqueueResponse = response.json();
     assert!(result.error.is_none());
@@ -257,9 +258,10 @@ async fn test_get_messages_endpoint() {
     let enqueue_request = EnqueueRequest {
         content: "test message".to_string(),
         ttl_seconds: None,
+        delay_seconds: None,
     };
     server.post("/queues/test_queue/messages").json(&enqueue_request).await.assert_status_ok();
-    
+
     // Get messages
     let get_request = GetMessagesRequest { count: 1 };
     let response = server
@@ -290,15 +292,16 @@ async fn test_delete_message_endpoint() {
     let enqueue_request = EnqueueRequest {
         content: "test message".to_string(),
         ttl_seconds: None,
+        delay_seconds: None,
     };
     server.post("/queues/test_queue/messages").json(&enqueue_request).await.assert_status_ok();
-    
+
     // Get the message
     let get_request = GetMessagesRequest { count: 1 };
     let response = server.post("/queues/test_queue/messages/get").json(&get_request).await;
     let messages: Vec<Message> = response.json();
     let receipt_handle = messages[0].receipt_handle.unwrap();
-    
+
     // Delete the message
     let delete_response = server
         .delete(&format!("/queues/test_queue/messages/{}", receipt_handle))
@@ -323,9 +326,9 @@ async fn test_batch_enqueue_endpoint() {
     // Batch enqueue
     let batch_request = BatchEnqueueRequest {
         messages: vec![
-            BatchMessageRequest { content: "message 1".to_string(), ttl_seconds: None },
-            BatchMessageRequest { content: "message 2".to_string(), ttl_seconds: Some(60) },
-            BatchMessageRequest { content: "message 3".to_string(), ttl_seconds: None },
+            BatchMessageRequest { content: "message 1".to_string(), ttl_seconds: None, delay_seconds: None },
+            BatchMessageRequest { content: "message 2".to_string(), ttl_seconds: Some(60), delay_seconds: None },
+            BatchMessageRequest { content: "message 3".to_string(), ttl_seconds: None, delay_seconds: None },
         ],
     };
     
@@ -357,9 +360,10 @@ async fn test_purge_queue_endpoint() {
     let enqueue_request = EnqueueRequest {
         content: "test message".to_string(),
         ttl_seconds: None,
+        delay_seconds: None,
     };
     server.post("/queues/test_queue/messages").json(&enqueue_request).await.assert_status_ok();
-    
+
     // Purge the queue
     let response = server.post("/queues/test_queue/purge").await;
     response.assert_status(StatusCode::NO_CONTENT);
@@ -410,8 +414,9 @@ async fn test_deduplication_endpoint() {
     let enqueue_request = EnqueueRequest {
         content: "duplicate message".to_string(),
         ttl_seconds: None,
+        delay_seconds: None,
     };
-    
+
     let response1 = server.post("/queues/dedup_queue/messages").json(&enqueue_request).await;
     response1.assert_status_ok();
     let result1: EnqueueResponse = response1.json();
