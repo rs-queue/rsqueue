@@ -1,5 +1,5 @@
 use axum::{
-    response::{Json, Response},
+    response::{Json, Response, sse::{Event, KeepAlive, Sse}},
     routing::{delete, get, post, put},
     Router,
     middleware,
@@ -9,11 +9,14 @@ use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use futures::stream::Stream;
 use prometheus::{TextEncoder, Encoder};
 use rsqueue::*;
 use serde::Serialize;
-use std::{path::PathBuf, time::{Duration, SystemTime}};
+use std::{convert::Infallible, path::PathBuf, time::{Duration, SystemTime}};
+use tokio_stream::{wrappers::BroadcastStream, StreamExt as _};
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::ServeDir;
 use tracing::info;
 use utoipa::{OpenApi, ToSchema};
 
@@ -308,6 +311,252 @@ async fn basic_auth_middleware(
     }
 }
 
+// SSE endpoint for real-time event streaming
+async fn sse_events(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let receiver = state.event_broadcaster.subscribe();
+
+    // Convert broadcast receiver to a stream
+    let stream = BroadcastStream::new(receiver).filter_map(|result| {
+        match result {
+            Ok(event) => {
+                let json = serde_json::to_string(&event).ok()?;
+                Some(Ok(Event::default().data(json)))
+            }
+            Err(_) => None, // Skip lagged messages
+        }
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+// SSE endpoint for queue-specific events
+async fn sse_queue_events(
+    State(state): State<AppState>,
+    Path(queue_name): Path<String>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let receiver = state.event_broadcaster.subscribe();
+    let queue_name = queue_name.clone();
+
+    // Filter events for specific queue
+    let stream = BroadcastStream::new(receiver).filter_map(move |result| {
+        match result {
+            Ok(event) => {
+                let is_relevant = match &event {
+                    QueueEvent::MessageEnqueued { queue_name: qn, .. } => *qn == queue_name,
+                    QueueEvent::MessagesDequeued { queue_name: qn, .. } => *qn == queue_name,
+                    QueueEvent::MessageDeleted { queue_name: qn, .. } => *qn == queue_name,
+                    QueueEvent::BatchDeleted { queue_name: qn, .. } => *qn == queue_name,
+                    QueueEvent::QueuePurged { queue_name: qn, .. } => *qn == queue_name,
+                    QueueEvent::QueueDeleted { queue_name: qn, .. } => *qn == queue_name,
+                    QueueEvent::Heartbeat { .. } => true, // Always include heartbeats
+                    QueueEvent::MetricsUpdate { .. } => true, // Always include metrics
+                    QueueEvent::QueueCreated { .. } => false,
+                };
+
+                if is_relevant {
+                    let json = serde_json::to_string(&event).ok()?;
+                    Some(Ok(Event::default().data(json)))
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        }
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+// Handlers with event broadcasting
+
+async fn create_queue_with_events(
+    State(state): State<AppState>,
+    Json(req): Json<CreateQueueRequest>,
+) -> Result<Json<QueueSpec>, StatusCode> {
+    let result = create_queue(State(state.clone()), Json(req)).await;
+
+    if let Ok(Json(ref spec)) = result {
+        state.event_broadcaster.broadcast(QueueEvent::QueueCreated {
+            queue_name: spec.name.clone(),
+            timestamp: Utc::now(),
+        });
+    }
+
+    result
+}
+
+async fn delete_queue_with_events(
+    State(state): State<AppState>,
+    Path(queue_name): Path<String>,
+) -> StatusCode {
+    let result = delete_queue(State(state.clone()), Path(queue_name.clone())).await;
+
+    if result == StatusCode::NO_CONTENT {
+        state.event_broadcaster.broadcast(QueueEvent::QueueDeleted {
+            queue_name,
+            timestamp: Utc::now(),
+        });
+    }
+
+    result
+}
+
+async fn purge_queue_with_events(
+    State(state): State<AppState>,
+    Path(queue_name): Path<String>,
+) -> StatusCode {
+    let result = purge_queue(State(state.clone()), Path(queue_name.clone())).await;
+
+    if result == StatusCode::NO_CONTENT {
+        state.event_broadcaster.broadcast(QueueEvent::QueuePurged {
+            queue_name,
+            timestamp: Utc::now(),
+        });
+    }
+
+    result
+}
+
+async fn enqueue_message_with_events(
+    State(state): State<AppState>,
+    Path(queue_name): Path<String>,
+    Json(req): Json<EnqueueRequest>,
+) -> Result<Json<EnqueueResponse>, StatusCode> {
+    let result = enqueue_message(State(state.clone()), Path(queue_name.clone()), Json(req)).await;
+
+    if let Ok(Json(ref response)) = result {
+        if response.error.is_none() {
+            let queues = state.queues.read().await;
+            let queue_depth = queues.get(&queue_name).map(|q| q.size()).unwrap_or(0);
+            drop(queues);
+
+            state.event_broadcaster.broadcast(QueueEvent::MessageEnqueued {
+                queue_name,
+                message_id: response.id,
+                queue_depth,
+                timestamp: Utc::now(),
+            });
+        }
+    }
+
+    result
+}
+
+async fn enqueue_batch_with_events(
+    State(state): State<AppState>,
+    Path(queue_name): Path<String>,
+    Json(req): Json<BatchEnqueueRequest>,
+) -> Result<Json<BatchEnqueueResponse>, StatusCode> {
+    let result = enqueue_batch(State(state.clone()), Path(queue_name.clone()), Json(req)).await;
+
+    if let Ok(Json(ref response)) = result {
+        let queues = state.queues.read().await;
+        let queue_depth = queues.get(&queue_name).map(|q| q.size()).unwrap_or(0);
+        drop(queues);
+
+        // Broadcast individual events for each successful enqueue
+        for enqueue_result in &response.results {
+            if enqueue_result.error.is_none() {
+                state.event_broadcaster.broadcast(QueueEvent::MessageEnqueued {
+                    queue_name: queue_name.clone(),
+                    message_id: enqueue_result.id,
+                    queue_depth,
+                    timestamp: Utc::now(),
+                });
+            }
+        }
+    }
+
+    result
+}
+
+async fn get_messages_with_events(
+    State(state): State<AppState>,
+    Path(queue_name): Path<String>,
+    Json(req): Json<GetMessagesRequest>,
+) -> Result<Json<Vec<Message>>, StatusCode> {
+    let result = get_messages(State(state.clone()), Path(queue_name.clone()), Json(req)).await;
+
+    if let Ok(Json(ref messages)) = result {
+        if !messages.is_empty() {
+            let queues = state.queues.read().await;
+            let queue_depth = queues.get(&queue_name).map(|q| q.size()).unwrap_or(0);
+            drop(queues);
+
+            state.event_broadcaster.broadcast(QueueEvent::MessagesDequeued {
+                queue_name,
+                count: messages.len(),
+                queue_depth,
+                timestamp: Utc::now(),
+            });
+        }
+    }
+
+    result
+}
+
+async fn delete_message_with_events(
+    State(state): State<AppState>,
+    Path((queue_name, receipt_handle)): Path<(String, uuid::Uuid)>,
+) -> StatusCode {
+    let result = delete_message(State(state.clone()), Path((queue_name.clone(), receipt_handle))).await;
+
+    if result == StatusCode::NO_CONTENT {
+        let queues = state.queues.read().await;
+        let queue_depth = queues.get(&queue_name).map(|q| q.size()).unwrap_or(0);
+        drop(queues);
+
+        state.event_broadcaster.broadcast(QueueEvent::MessageDeleted {
+            queue_name,
+            receipt_handle,
+            queue_depth,
+            timestamp: Utc::now(),
+        });
+    }
+
+    result
+}
+
+async fn batch_delete_with_events(
+    State(state): State<AppState>,
+    Path(queue_name): Path<String>,
+    Json(req): Json<BatchDeleteRequest>,
+) -> Result<Json<BatchDeleteResponse>, StatusCode> {
+    let result = batch_delete_messages(State(state.clone()), Path(queue_name.clone()), Json(req)).await;
+
+    if let Ok(Json(ref response)) = result {
+        let queues = state.queues.read().await;
+        let queue_depth = queues.get(&queue_name).map(|q| q.size()).unwrap_or(0);
+        drop(queues);
+
+        state.event_broadcaster.broadcast(QueueEvent::BatchDeleted {
+            queue_name,
+            successful: response.successful,
+            failed: response.failed,
+            queue_depth,
+            timestamp: Utc::now(),
+        });
+    }
+
+    result
+}
+
+// Serve dashboard at root
+async fn serve_dashboard() -> Response {
+    match std::fs::read_to_string("static/dashboard.html") {
+        Ok(content) => Response::builder()
+            .header("Content-Type", "text/html")
+            .body(content.into())
+            .unwrap(),
+        Err(_) => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body("Dashboard not found. Make sure static/dashboard.html exists.".into())
+            .unwrap(),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -318,7 +567,14 @@ async fn main() {
     // Check for authentication configuration
     let auth_validator = BasicAuthValidator::from_env();
 
+    // Create static directory if it doesn't exist
+    std::fs::create_dir_all("./static").ok();
+
     let app = Router::new()
+        // Dashboard at root
+        .route("/", get(serve_dashboard))
+        .route("/dashboard", get(serve_dashboard))
+
         // Add OpenAPI JSON endpoint
         .route("/api-docs/openapi.json", get(|| async {
             Json(ApiDoc::openapi())
@@ -330,21 +586,25 @@ async fn main() {
         .route("/metrics/summary", get(get_metrics_summary))
         .route("/queues/:name/metrics", get(get_queue_metrics))
 
-        // Queue management
-        .route("/queues", post(create_queue))
-        .route("/queues", get(list_queues))
-        .route("/queues/:name", delete(delete_queue))
-        .route("/queues/:name/settings", put(update_queue_settings))
-        .route("/queues/:name/purge", post(purge_queue))
+        // SSE endpoints for real-time updates
+        .route("/events", get(sse_events))
+        .route("/queues/:name/events", get(sse_queue_events))
 
-        // Message operations
-        .route("/queues/:name/messages", post(enqueue_message))
-        .route("/queues/:name/messages/batch", post(enqueue_batch))
-        .route("/queues/:name/messages/get", post(get_messages))
+        // Queue management (with event broadcasting)
+        .route("/queues", post(create_queue_with_events))
+        .route("/queues", get(list_queues))
+        .route("/queues/:name", delete(delete_queue_with_events))
+        .route("/queues/:name/settings", put(update_queue_settings))
+        .route("/queues/:name/purge", post(purge_queue_with_events))
+
+        // Message operations (with event broadcasting)
+        .route("/queues/:name/messages", post(enqueue_message_with_events))
+        .route("/queues/:name/messages/batch", post(enqueue_batch_with_events))
+        .route("/queues/:name/messages/get", post(get_messages_with_events))
         .route("/queues/:name/messages/peek", post(peek_messages))
         .route("/queues/:name/messages/all", get(list_all_messages))
-        .route("/queues/:name/messages/:receipt_handle", delete(delete_message))
-        .route("/queues/:name/messages/batch-delete", post(batch_delete_messages))
+        .route("/queues/:name/messages/:receipt_handle", delete(delete_message_with_events))
+        .route("/queues/:name/messages/batch-delete", post(batch_delete_with_events))
 
         // Queue details
         .route("/queues/:name/details", get(get_queue_details))
@@ -352,6 +612,9 @@ async fn main() {
         // Time-series statistics for graphs
         .route("/queues/:name/stats/history", get(get_queue_history))
         .route("/stats/history", get(get_global_history))
+
+        // Serve static files for frontend dashboard
+        .nest_service("/static", ServeDir::new("static"))
 
         // Configure CORS to allow all origins, methods, and headers
         .layer(

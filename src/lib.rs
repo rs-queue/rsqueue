@@ -15,9 +15,96 @@ use std::{
     path::PathBuf,
     sync::Arc,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+// SSE Event types for real-time updates
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum QueueEvent {
+    #[serde(rename = "queue_created")]
+    QueueCreated {
+        queue_name: String,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "queue_deleted")]
+    QueueDeleted {
+        queue_name: String,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "queue_purged")]
+    QueuePurged {
+        queue_name: String,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "message_enqueued")]
+    MessageEnqueued {
+        queue_name: String,
+        message_id: Uuid,
+        queue_depth: usize,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "messages_dequeued")]
+    MessagesDequeued {
+        queue_name: String,
+        count: usize,
+        queue_depth: usize,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "message_deleted")]
+    MessageDeleted {
+        queue_name: String,
+        receipt_handle: Uuid,
+        queue_depth: usize,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "batch_deleted")]
+    BatchDeleted {
+        queue_name: String,
+        successful: usize,
+        failed: usize,
+        queue_depth: usize,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "metrics_update")]
+    MetricsUpdate {
+        active_queues: usize,
+        total_pending: usize,
+        total_in_flight: usize,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "heartbeat")]
+    Heartbeat {
+        timestamp: DateTime<Utc>,
+    },
+}
+
+// Event broadcaster for SSE
+#[derive(Clone)]
+pub struct EventBroadcaster {
+    sender: broadcast::Sender<QueueEvent>,
+}
+
+impl EventBroadcaster {
+    pub fn new(capacity: usize) -> Self {
+        let (sender, _) = broadcast::channel(capacity);
+        Self { sender }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<QueueEvent> {
+        self.sender.subscribe()
+    }
+
+    pub fn broadcast(&self, event: QueueEvent) {
+        // Ignore errors when no subscribers
+        let _ = self.sender.send(event);
+    }
+
+    pub fn subscriber_count(&self) -> usize {
+        self.sender.receiver_count()
+    }
+}
 
 lazy_static::lazy_static! {
     static ref REGISTRY: Registry = Registry::new();
@@ -705,17 +792,20 @@ impl Queue {
 pub struct AppState {
     pub queues: Arc<RwLock<HashMap<String, Queue>>>,
     pub storage_path: PathBuf,
+    pub event_broadcaster: Arc<EventBroadcaster>,
 }
 
 impl AppState {
     pub fn new(storage_path: PathBuf) -> Self {
         // Initialize metrics registry
         Self::initialize_metrics();
-        
+
         fs::create_dir_all(&storage_path).ok();
+        let event_broadcaster = Arc::new(EventBroadcaster::new(1000));
         let state = Self {
             queues: Arc::new(RwLock::new(HashMap::new())),
             storage_path,
+            event_broadcaster,
         };
         
         // Load existing queue specs
