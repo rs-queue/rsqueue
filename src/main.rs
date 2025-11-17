@@ -81,7 +81,9 @@ struct QueueMetrics {
         batch_delete_messages,
         peek_messages,
         get_queue_details,
-        list_all_messages
+        list_all_messages,
+        get_queue_history,
+        get_global_history
     ),
     components(schemas(
         HealthStatus,
@@ -104,12 +106,16 @@ struct QueueMetrics {
         QueueDetailInfo,
         BatchDeleteRequest,
         BatchDeleteResponse,
-        DeleteResult
+        DeleteResult,
+        TimeSeriesPoint,
+        QueueTimeSeries,
+        GlobalTimeSeries
     )),
     tags(
         (name = "health", description = "Health check and monitoring endpoints"),
         (name = "queues", description = "Queue management operations"),
-        (name = "messages", description = "Message operations")
+        (name = "messages", description = "Message operations"),
+        (name = "stats", description = "Statistics and time-series data for graphs")
     ),
     info(
         title = "RSQueue API",
@@ -342,6 +348,10 @@ async fn main() {
 
         // Queue details
         .route("/queues/:name/details", get(get_queue_details))
+
+        // Time-series statistics for graphs
+        .route("/queues/:name/stats/history", get(get_queue_history))
+        .route("/stats/history", get(get_global_history))
 
         // Configure CORS to allow all origins, methods, and headers
         .layer(

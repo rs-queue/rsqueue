@@ -1,16 +1,16 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 use prometheus::{Histogram, IntCounter, IntGauge, Registry};
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fs,
     path::PathBuf,
     sync::Arc,
@@ -128,12 +128,146 @@ pub struct QueueSpec {
     pub deduplication_window_seconds: u64, // How long to remember message hashes
 }
 
+// Time-series tracking for graphs
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TimeSeriesPoint {
+    pub timestamp: DateTime<Utc>,
+    pub enqueued: u64,
+    pub dequeued: u64,
+    pub deleted: u64,
+    pub queue_depth: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct QueueTimeSeries {
+    pub queue_name: String,
+    pub data_points: Vec<TimeSeriesPoint>,
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub granularity_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GlobalTimeSeries {
+    pub data_points: Vec<TimeSeriesPoint>,
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub granularity_seconds: u64,
+}
+
+// Internal structure for tracking events in time buckets
+#[derive(Debug, Clone, Default)]
+pub struct TimeBucketStats {
+    pub enqueued: u64,
+    pub dequeued: u64,
+    pub deleted: u64,
+    pub queue_depth_samples: Vec<usize>,
+}
+
+#[derive(Debug)]
+pub struct TimeSeriesTracker {
+    // Store stats per minute bucket (key is timestamp truncated to minute)
+    pub buckets: BTreeMap<DateTime<Utc>, TimeBucketStats>,
+    pub max_retention_hours: u64,
+}
+
+impl TimeSeriesTracker {
+    pub fn new(max_retention_hours: u64) -> Self {
+        Self {
+            buckets: BTreeMap::new(),
+            max_retention_hours,
+        }
+    }
+
+    fn truncate_to_minute(dt: DateTime<Utc>) -> DateTime<Utc> {
+        dt.date_naive()
+            .and_hms_opt(dt.time().hour(), dt.time().minute(), 0)
+            .unwrap()
+            .and_utc()
+    }
+
+    pub fn record_enqueue(&mut self, queue_depth: usize) {
+        let bucket_time = Self::truncate_to_minute(Utc::now());
+        let stats = self.buckets.entry(bucket_time).or_default();
+        stats.enqueued += 1;
+        stats.queue_depth_samples.push(queue_depth);
+        self.cleanup_old_buckets();
+    }
+
+    pub fn record_dequeue(&mut self, count: usize, queue_depth: usize) {
+        let bucket_time = Self::truncate_to_minute(Utc::now());
+        let stats = self.buckets.entry(bucket_time).or_default();
+        stats.dequeued += count as u64;
+        stats.queue_depth_samples.push(queue_depth);
+        self.cleanup_old_buckets();
+    }
+
+    pub fn record_delete(&mut self, queue_depth: usize) {
+        let bucket_time = Self::truncate_to_minute(Utc::now());
+        let stats = self.buckets.entry(bucket_time).or_default();
+        stats.deleted += 1;
+        stats.queue_depth_samples.push(queue_depth);
+        self.cleanup_old_buckets();
+    }
+
+    pub fn record_batch_delete(&mut self, count: usize, queue_depth: usize) {
+        let bucket_time = Self::truncate_to_minute(Utc::now());
+        let stats = self.buckets.entry(bucket_time).or_default();
+        stats.deleted += count as u64;
+        stats.queue_depth_samples.push(queue_depth);
+        self.cleanup_old_buckets();
+    }
+
+    fn cleanup_old_buckets(&mut self) {
+        let cutoff = Utc::now() - Duration::hours(self.max_retention_hours as i64);
+        self.buckets.retain(|time, _| *time >= cutoff);
+    }
+
+    pub fn get_data_points(&self, from: DateTime<Utc>, to: DateTime<Utc>, granularity_seconds: u64) -> Vec<TimeSeriesPoint> {
+        let mut result = Vec::new();
+        let granularity = Duration::seconds(granularity_seconds as i64);
+
+        let mut current = Self::truncate_to_minute(from);
+        while current <= to {
+            let mut point = TimeSeriesPoint {
+                timestamp: current,
+                enqueued: 0,
+                dequeued: 0,
+                deleted: 0,
+                queue_depth: 0,
+            };
+
+            // Aggregate buckets within this granularity window
+            let window_end = current + granularity;
+            let mut depth_samples = Vec::new();
+
+            for (_bucket_time, stats) in self.buckets.range(current..window_end) {
+                point.enqueued += stats.enqueued;
+                point.dequeued += stats.dequeued;
+                point.deleted += stats.deleted;
+                depth_samples.extend(&stats.queue_depth_samples);
+            }
+
+            // Use average queue depth for the window
+            if !depth_samples.is_empty() {
+                point.queue_depth = depth_samples.iter().sum::<usize>() / depth_samples.len();
+            }
+
+            result.push(point);
+            current = window_end;
+        }
+
+        result
+    }
+}
+
 #[derive(Debug)]
 pub struct Queue {
     pub spec: QueueSpec,
     pub messages: VecDeque<Message>,
     pub in_flight: HashMap<Uuid, Message>, // receipt_handle -> Message
     pub dedup_hashes: HashMap<String, DateTime<Utc>>, // content_hash -> expiry time
+    pub time_series: TimeSeriesTracker, // Track message events over time
 }
 
 // Additional atomic helper methods for Queue
@@ -150,6 +284,7 @@ impl Queue {
             messages: VecDeque::new(),
             in_flight: HashMap::new(),
             dedup_hashes: HashMap::new(),
+            time_series: TimeSeriesTracker::new(24), // Keep 24 hours of history by default
         }
     }
 
@@ -243,6 +378,7 @@ impl Queue {
         let id = message.id;
         self.messages.push_back(message);
         MESSAGES_ENQUEUED_TOTAL.inc();
+        self.time_series.record_enqueue(self.size());
         Ok(id)
     }
 
@@ -341,6 +477,11 @@ impl Queue {
             self.in_flight.insert(handle, msg);
         }
 
+        // Record dequeue event
+        if !result.is_empty() {
+            self.time_series.record_dequeue(result.len(), self.size());
+        }
+
         result
     }
 
@@ -350,6 +491,7 @@ impl Queue {
         let deleted = self.in_flight.remove(&receipt_handle).is_some();
         if deleted {
             MESSAGES_DELETED_TOTAL.inc();
+            self.time_series.record_delete(self.size());
         }
         deleted
     }
@@ -357,13 +499,24 @@ impl Queue {
     pub fn batch_delete_messages(&mut self, receipt_handles: Vec<Uuid>) -> Vec<DeleteResult> {
         // Preallocate with exact capacity for better performance
         let mut results = Vec::with_capacity(receipt_handles.len());
+        let mut successful_count = 0;
 
         for handle in receipt_handles {
-            let success = self.delete_message(handle);
+            // Don't call delete_message to avoid double-recording
+            let success = self.in_flight.remove(&handle).is_some();
+            if success {
+                MESSAGES_DELETED_TOTAL.inc();
+                successful_count += 1;
+            }
             results.push(DeleteResult {
                 receipt_handle: handle,
                 success,
             });
+        }
+
+        // Record batch delete event once for all successful deletes
+        if successful_count > 0 {
+            self.time_series.record_batch_delete(successful_count, self.size());
         }
 
         results
@@ -577,6 +730,7 @@ impl AppState {
                                     messages: VecDeque::new(),
                                     in_flight: HashMap::new(),
                                     dedup_hashes: HashMap::new(),
+                                    time_series: TimeSeriesTracker::new(24),
                                 };
                                 
                                 // For tests, just insert directly without spawning
@@ -817,6 +971,25 @@ pub struct QueueInfo {
     pub enable_deduplication: bool,
     pub deduplication_window_seconds: u64,
     pub dedup_cache_size: usize,
+}
+
+// Query parameters for time-series endpoints
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct TimeSeriesQuery {
+    /// Number of minutes to look back (default: 60)
+    #[serde(default = "default_history_minutes")]
+    pub minutes: u64,
+    /// Granularity in seconds for data aggregation (default: 60 = 1 minute)
+    #[serde(default = "default_granularity")]
+    pub granularity_seconds: u64,
+}
+
+pub fn default_history_minutes() -> u64 {
+    60 // Default to last hour
+}
+
+pub fn default_granularity() -> u64 {
+    60 // Default to 1 minute buckets
 }
 
 // Handlers
@@ -1350,15 +1523,118 @@ pub async fn list_all_messages(
 ) -> Result<Json<Vec<MessagePreview>>, StatusCode> {
     let _timer = HTTP_REQUEST_DURATION.start_timer();
     HTTP_REQUESTS_TOTAL.inc();
-    
+
     let queues = state.queues.read().await;
-    
+
     if let Some(queue) = queues.get(&queue_name) {
         let messages = queue.list_all_messages();
         Ok(Json(messages))
     } else {
         Err(StatusCode::NOT_FOUND)
     }
+}
+
+// Time-series API handlers for graphs
+#[utoipa::path(
+    get,
+    path = "/queues/{name}/stats/history",
+    tag = "stats",
+    params(
+        ("name" = String, Path, description = "Queue name"),
+        TimeSeriesQuery
+    ),
+    responses(
+        (status = 200, description = "Time-series data for queue", body = QueueTimeSeries),
+        (status = 404, description = "Queue not found")
+    )
+)]
+pub async fn get_queue_history(
+    State(state): State<AppState>,
+    Path(queue_name): Path<String>,
+    Query(params): Query<TimeSeriesQuery>,
+) -> Result<Json<QueueTimeSeries>, StatusCode> {
+    let _timer = HTTP_REQUEST_DURATION.start_timer();
+    HTTP_REQUESTS_TOTAL.inc();
+
+    let queues = state.queues.read().await;
+
+    if let Some(queue) = queues.get(&queue_name) {
+        let to = Utc::now();
+        let from = to - Duration::minutes(params.minutes as i64);
+
+        let data_points = queue.time_series.get_data_points(from, to, params.granularity_seconds);
+
+        Ok(Json(QueueTimeSeries {
+            queue_name: queue_name.clone(),
+            data_points,
+            from,
+            to,
+            granularity_seconds: params.granularity_seconds,
+        }))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/stats/history",
+    tag = "stats",
+    params(TimeSeriesQuery),
+    responses(
+        (status = 200, description = "Global time-series data across all queues", body = GlobalTimeSeries)
+    )
+)]
+pub async fn get_global_history(
+    State(state): State<AppState>,
+    Query(params): Query<TimeSeriesQuery>,
+) -> Json<GlobalTimeSeries> {
+    let _timer = HTTP_REQUEST_DURATION.start_timer();
+    HTTP_REQUESTS_TOTAL.inc();
+
+    let queues = state.queues.read().await;
+    let to = Utc::now();
+    let from = to - Duration::minutes(params.minutes as i64);
+    let granularity = Duration::seconds(params.granularity_seconds as i64);
+
+    // Collect all data points from all queues
+    let mut aggregated: BTreeMap<DateTime<Utc>, TimeSeriesPoint> = BTreeMap::new();
+
+    // Initialize time buckets
+    let mut current = TimeSeriesTracker::truncate_to_minute(from);
+    while current <= to {
+        aggregated.insert(current, TimeSeriesPoint {
+            timestamp: current,
+            enqueued: 0,
+            dequeued: 0,
+            deleted: 0,
+            queue_depth: 0,
+        });
+        current = current + granularity;
+    }
+
+    // Aggregate data from all queues
+    for queue in queues.values() {
+        let queue_points = queue.time_series.get_data_points(from, to, params.granularity_seconds);
+
+        for point in queue_points {
+            if let Some(agg_point) = aggregated.get_mut(&point.timestamp) {
+                agg_point.enqueued += point.enqueued;
+                agg_point.dequeued += point.dequeued;
+                agg_point.deleted += point.deleted;
+                agg_point.queue_depth += point.queue_depth;
+            }
+        }
+    }
+
+    let data_points: Vec<TimeSeriesPoint> = aggregated.into_values().collect();
+
+    Json(GlobalTimeSeries {
+        data_points,
+        from,
+        to,
+        granularity_seconds: params.granularity_seconds,
+    })
 }
 
 #[cfg(test)]
