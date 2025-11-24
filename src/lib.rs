@@ -213,6 +213,7 @@ pub struct QueueSpec {
     pub visibility_timeout_seconds: u64,
     pub enable_deduplication: bool,
     pub deduplication_window_seconds: u64, // How long to remember message hashes
+    pub default_message_ttl_seconds: Option<u64>, // Queue-level default TTL for messages
 }
 
 // Time-series tracking for graphs
@@ -359,7 +360,7 @@ pub struct Queue {
 
 // Additional atomic helper methods for Queue
 impl Queue {
-    pub fn new(name: String, visibility_timeout_seconds: u64, enable_deduplication: bool, deduplication_window_seconds: u64) -> Self {
+    pub fn new(name: String, visibility_timeout_seconds: u64, enable_deduplication: bool, deduplication_window_seconds: u64, default_message_ttl_seconds: Option<u64>) -> Self {
         Self {
             spec: QueueSpec {
                 name,
@@ -367,6 +368,7 @@ impl Queue {
                 visibility_timeout_seconds,
                 enable_deduplication,
                 deduplication_window_seconds,
+                default_message_ttl_seconds,
             },
             messages: VecDeque::new(),
             in_flight: HashMap::new(),
@@ -446,8 +448,9 @@ impl Queue {
             self.dedup_hashes.insert(content_hash.clone(), expiry);
         }
 
-        // Calculate expiration time if TTL is specified
-        let expires_at = ttl_seconds.map(|ttl| Utc::now() + Duration::seconds(ttl as i64));
+        // Calculate expiration time if TTL is specified, or use queue's default TTL
+        let ttl_to_use = ttl_seconds.or(self.spec.default_message_ttl_seconds);
+        let expires_at = ttl_to_use.map(|ttl| Utc::now() + Duration::seconds(ttl as i64));
 
         // Calculate delivery time if delay is specified
         let delivery_after = delay_seconds.map(|delay| Utc::now() + Duration::seconds(delay as i64));
@@ -917,6 +920,8 @@ pub struct CreateQueueRequest {
     pub enable_deduplication: bool,
     #[serde(default = "default_deduplication_window")]
     pub deduplication_window_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_message_ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -927,6 +932,8 @@ pub struct UpdateQueueRequest {
     pub enable_deduplication: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deduplication_window_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_message_ttl_seconds: Option<u64>,
 }
 
 pub fn default_visibility_timeout() -> u64 {
@@ -1108,10 +1115,11 @@ pub async fn create_queue(
     }
     
     let queue = Queue::new(
-        req.name.clone(), 
+        req.name.clone(),
         req.visibility_timeout_seconds,
         req.enable_deduplication,
-        req.deduplication_window_seconds
+        req.deduplication_window_seconds,
+        req.default_message_ttl_seconds
     );
     let spec = queue.spec.clone();
     
@@ -1172,6 +1180,11 @@ pub async fn update_queue_settings(
 
         if let Some(dedup_window) = req.deduplication_window_seconds {
             queue.spec.deduplication_window_seconds = dedup_window;
+            updated = true;
+        }
+
+        if let Some(default_ttl) = req.default_message_ttl_seconds {
+            queue.spec.default_message_ttl_seconds = Some(default_ttl);
             updated = true;
         }
 
