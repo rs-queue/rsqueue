@@ -86,7 +86,8 @@ struct QueueMetrics {
         get_queue_details,
         list_all_messages,
         get_queue_history,
-        get_global_history
+        get_global_history,
+        cleanup_expired_messages
     ),
     components(schemas(
         HealthStatus,
@@ -112,7 +113,8 @@ struct QueueMetrics {
         DeleteResult,
         TimeSeriesPoint,
         QueueTimeSeries,
-        GlobalTimeSeries
+        GlobalTimeSeries,
+        CleanupResponse
     )),
     tags(
         (name = "health", description = "Health check and monitoring endpoints"),
@@ -596,6 +598,7 @@ async fn main() {
         .route("/queues/:name", delete(delete_queue_with_events))
         .route("/queues/:name/settings", put(update_queue_settings))
         .route("/queues/:name/purge", post(purge_queue_with_events))
+        .route("/queues/:name/cleanup", post(cleanup_expired_messages))
 
         // Message operations (with event broadcasting)
         .route("/queues/:name/messages", post(enqueue_message_with_events))

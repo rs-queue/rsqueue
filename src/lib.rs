@@ -390,9 +390,11 @@ impl Queue {
     }
 
     // Remove messages that have exceeded their TTL
-    fn clean_expired_messages(&mut self) {
+    // Returns the number of messages removed
+    pub fn clean_expired_messages(&mut self) -> usize {
         let now = Utc::now();
         let initial_count = self.messages.len();
+        let initial_in_flight = self.in_flight.len();
         let default_ttl = self.spec.default_message_ttl_seconds;
 
         // Remove expired messages from the main queue
@@ -432,10 +434,19 @@ impl Queue {
         }
 
         // Track how many messages were removed
-        let removed_count = initial_count - self.messages.len();
-        if removed_count > 0 {
-            info!("Removed {} expired messages from queue {}", removed_count, self.spec.name);
+        let removed_from_queue = initial_count - self.messages.len();
+        let removed_from_in_flight = initial_in_flight - self.in_flight.len();
+        let total_removed = removed_from_queue + removed_from_in_flight;
+
+        if total_removed > 0 {
+            info!("Removed {} expired messages from queue {} ({} from queue, {} from in-flight)",
+                  total_removed, self.spec.name, removed_from_queue, removed_from_in_flight);
+            for _ in 0..total_removed {
+                MESSAGES_EXPIRED_TOTAL.inc();
+            }
         }
+
+        total_removed
     }
 
     pub fn enqueue(&mut self, content: String, ttl_seconds: Option<u64>, delay_seconds: Option<u64>) -> Result<Uuid, String> {
@@ -1506,6 +1517,45 @@ pub async fn purge_queue(
         StatusCode::NO_CONTENT
     } else {
         StatusCode::NOT_FOUND
+    }
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct CleanupResponse {
+    pub queue_name: String,
+    pub messages_removed: usize,
+}
+
+#[utoipa::path(
+    post,
+    path = "/queues/{name}/cleanup",
+    tag = "queues",
+    params(
+        ("name" = String, Path, description = "Queue name")
+    ),
+    responses(
+        (status = 200, description = "Cleanup completed", body = CleanupResponse),
+        (status = 404, description = "Queue not found")
+    )
+)]
+pub async fn cleanup_expired_messages(
+    State(state): State<AppState>,
+    Path(queue_name): Path<String>,
+) -> Result<Json<CleanupResponse>, StatusCode> {
+    let _timer = HTTP_REQUEST_DURATION.start_timer();
+    HTTP_REQUESTS_TOTAL.inc();
+
+    let mut queues = state.queues.write().await;
+
+    if let Some(queue) = queues.get_mut(&queue_name) {
+        let removed = queue.clean_expired_messages();
+        info!("Manual cleanup on queue {}: removed {} expired messages", queue_name, removed);
+        Ok(Json(CleanupResponse {
+            queue_name,
+            messages_removed: removed,
+        }))
+    } else {
+        Err(StatusCode::NOT_FOUND)
     }
 }
 
