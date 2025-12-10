@@ -393,13 +393,20 @@ impl Queue {
     fn clean_expired_messages(&mut self) {
         let now = Utc::now();
         let initial_count = self.messages.len();
+        let default_ttl = self.spec.default_message_ttl_seconds;
 
         // Remove expired messages from the main queue
         self.messages.retain(|msg| {
             if let Some(expires_at) = msg.expires_at {
+                // Message has explicit TTL - use it
                 expires_at > now
+            } else if let Some(ttl_seconds) = default_ttl {
+                // Message has no explicit TTL but queue has default TTL
+                // Apply retroactively based on message creation time
+                let effective_expires_at = msg.created_at + Duration::seconds(ttl_seconds as i64);
+                effective_expires_at > now
             } else {
-                true // Messages without TTL never expire
+                true // No TTL configured - message never expires
             }
         });
 
@@ -407,15 +414,16 @@ impl Queue {
         let expired_in_flight: Vec<Uuid> = self.in_flight
             .iter()
             .filter_map(|(handle, msg)| {
-                if let Some(expires_at) = msg.expires_at {
-                    if expires_at <= now {
-                        Some(*handle)
-                    } else {
-                        None
-                    }
+                let is_expired = if let Some(expires_at) = msg.expires_at {
+                    expires_at <= now
+                } else if let Some(ttl_seconds) = default_ttl {
+                    // Apply retroactively based on message creation time
+                    let effective_expires_at = msg.created_at + Duration::seconds(ttl_seconds as i64);
+                    effective_expires_at <= now
                 } else {
-                    None
-                }
+                    false
+                };
+                if is_expired { Some(*handle) } else { None }
             })
             .collect();
 
@@ -748,6 +756,7 @@ impl Queue {
             enable_deduplication: self.spec.enable_deduplication,
             deduplication_window_seconds: self.spec.deduplication_window_seconds,
             dedup_cache_size: self.get_dedup_cache_size(),
+            default_message_ttl_seconds: self.spec.default_message_ttl_seconds,
             messages_pending: self.messages.len(),
             messages_in_flight: self.in_flight.len(),
             visible_messages: self.get_visible_count(),
@@ -1044,6 +1053,8 @@ pub struct QueueDetailInfo {
     pub enable_deduplication: bool,
     pub deduplication_window_seconds: u64,
     pub dedup_cache_size: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_message_ttl_seconds: Option<u64>,
     pub messages_pending: usize,
     pub messages_in_flight: usize,
     pub visible_messages: usize,
@@ -1068,6 +1079,8 @@ pub struct QueueInfo {
     pub enable_deduplication: bool,
     pub deduplication_window_seconds: u64,
     pub dedup_cache_size: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_message_ttl_seconds: Option<u64>,
 }
 
 // Query parameters for time-series endpoints
@@ -1185,6 +1198,8 @@ pub async fn update_queue_settings(
 
         if let Some(default_ttl) = req.default_message_ttl_seconds {
             queue.spec.default_message_ttl_seconds = Some(default_ttl);
+            // Immediately clean up messages that exceed the new TTL
+            queue.clean_expired_messages();
             updated = true;
         }
 
@@ -1230,6 +1245,7 @@ pub async fn list_queues(State(state): State<AppState>) -> Json<Vec<QueueInfo>> 
             enable_deduplication: queue.spec.enable_deduplication,
             deduplication_window_seconds: queue.spec.deduplication_window_seconds,
             dedup_cache_size: queue.get_dedup_cache_size(),
+            default_message_ttl_seconds: queue.spec.default_message_ttl_seconds,
         })
         .collect();
     
@@ -1753,6 +1769,7 @@ mod tests {
             30,
             false,
             300,
+            None,
         );
 
         // Test message without TTL (should not expire)
@@ -1785,6 +1802,7 @@ mod tests {
             30,
             false,
             300,
+            None,
         );
 
         // Add a message with a very short TTL (1 second)
@@ -1825,6 +1843,7 @@ mod tests {
             30,
             false,
             300,
+            None,
         );
 
         let batch = vec![
@@ -1873,6 +1892,7 @@ mod tests {
             30,
             false,
             300,
+            None,
         );
 
         // Create a message that has already expired
@@ -1928,6 +1948,7 @@ mod tests {
             30,
             false,
             300,
+            None,
         );
 
         let _id1 = queue.enqueue("Message with TTL".to_string(), Some(60), None).unwrap();
@@ -1957,6 +1978,7 @@ mod tests {
             30,
             false,
             300,
+            None,
         );
 
         // Add immediate message
@@ -1988,6 +2010,7 @@ mod tests {
             30,
             false,
             300,
+            None,
         );
 
         // Enqueue some messages
@@ -2021,6 +2044,7 @@ mod tests {
             30,
             false,
             300,
+            None,
         );
 
         // Empty queue statistics
