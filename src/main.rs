@@ -70,6 +70,7 @@ struct QueueMetrics {
 #[openapi(
     paths(
         health_check,
+        get_version,
         get_metrics_summary,
         get_queue_metrics,
         create_queue,
@@ -91,6 +92,7 @@ struct QueueMetrics {
     ),
     components(schemas(
         HealthStatus,
+        VersionInfo,
         MetricsSummary,
         QueueMetrics,
         Message,
@@ -134,6 +136,27 @@ struct QueueMetrics {
 struct ApiDoc;
 
 static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
+
+#[derive(Serialize, ToSchema)]
+struct VersionInfo {
+    version: String,
+    git_hash: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/version",
+    tag = "health",
+    responses(
+        (status = 200, description = "Version information", body = VersionInfo)
+    )
+)]
+async fn get_version() -> Json<VersionInfo> {
+    Json(VersionInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        git_hash: option_env!("GIT_HASH").map(String::from),
+    })
+}
 
 #[utoipa::path(
     get,
@@ -584,6 +607,7 @@ async fn main() {
 
         // Health check and monitoring
         .route("/health", get(health_check))
+        .route("/version", get(get_version))
         .route("/metrics", get(get_metrics))
         .route("/metrics/summary", get(get_metrics_summary))
         .route("/queues/:name/metrics", get(get_queue_metrics))
