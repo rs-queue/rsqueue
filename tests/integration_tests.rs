@@ -12,11 +12,11 @@ use std::{
 use uuid::Uuid;
 
 fn create_test_queue() -> Queue {
-    Queue::new("test_queue".to_string(), 120, false, 300)
+    Queue::new("test_queue".to_string(), 120, false, 300, None)
 }
 
 fn create_test_queue_with_dedup() -> Queue {
-    Queue::new("test_dedup_queue".to_string(), 120, true, 300)
+    Queue::new("test_dedup_queue".to_string(), 120, true, 300, None)
 }
 
 #[tokio::test]
@@ -92,7 +92,7 @@ async fn test_message_deletion() {
 
 #[tokio::test]
 async fn test_visibility_timeout() {
-    let mut queue = Queue::new("test".to_string(), 1, false, 300); // 1 second timeout
+    let mut queue = Queue::new("test".to_string(), 1, false, 300, None); // 1 second timeout
     
     queue.enqueue("test message".to_string(), None, None).unwrap();
     let messages = queue.dequeue(1);
@@ -123,8 +123,8 @@ async fn test_queue_purge() {
 
 #[tokio::test]
 async fn test_visible_count() {
-    let mut queue = Queue::new("test".to_string(), 1, false, 300);
-    
+    let mut queue = Queue::new("test".to_string(), 1, false, 300, None);
+
     queue.enqueue("msg1".to_string(), None, None).unwrap();
     queue.enqueue("msg2".to_string(), None, None).unwrap();
     assert_eq!(queue.get_visible_count(), 2);
@@ -174,6 +174,7 @@ async fn test_create_queue_endpoint() {
         visibility_timeout_seconds: 300,
         enable_deduplication: false,
         deduplication_window_seconds: 600,
+        default_message_ttl_seconds: None,
     };
     
     let response = server
@@ -197,8 +198,9 @@ async fn test_list_queues_endpoint() {
         visibility_timeout_seconds: 120,
         enable_deduplication: false,
         deduplication_window_seconds: 300,
+        default_message_ttl_seconds: None,
     };
-    
+
     server.post("/queues").json(&request).await.assert_status_ok();
     
     // List queues
@@ -220,9 +222,10 @@ async fn test_enqueue_message_endpoint() {
         visibility_timeout_seconds: 120,
         enable_deduplication: false,
         deduplication_window_seconds: 300,
+        default_message_ttl_seconds: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
-    
+
     // Enqueue a message
     let enqueue_request = EnqueueRequest {
         content: "test message".to_string(),
@@ -244,13 +247,14 @@ async fn test_enqueue_message_endpoint() {
 #[tokio::test]
 async fn test_get_messages_endpoint() {
     let server = create_test_app().await;
-    
+
     // Create a queue
     let create_request = CreateQueueRequest {
         name: "test_queue".to_string(),
         visibility_timeout_seconds: 120,
         enable_deduplication: false,
         deduplication_window_seconds: 300,
+        default_message_ttl_seconds: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
     
@@ -279,13 +283,14 @@ async fn test_get_messages_endpoint() {
 #[tokio::test]
 async fn test_delete_message_endpoint() {
     let server = create_test_app().await;
-    
+
     // Create queue and enqueue message
     let create_request = CreateQueueRequest {
         name: "test_queue".to_string(),
         visibility_timeout_seconds: 120,
         enable_deduplication: false,
         deduplication_window_seconds: 300,
+        default_message_ttl_seconds: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
     
@@ -313,13 +318,14 @@ async fn test_delete_message_endpoint() {
 #[tokio::test]
 async fn test_batch_enqueue_endpoint() {
     let server = create_test_app().await;
-    
+
     // Create a queue
     let create_request = CreateQueueRequest {
         name: "test_queue".to_string(),
         visibility_timeout_seconds: 120,
         enable_deduplication: false,
         deduplication_window_seconds: 300,
+        default_message_ttl_seconds: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
     
@@ -347,13 +353,14 @@ async fn test_batch_enqueue_endpoint() {
 #[tokio::test]
 async fn test_purge_queue_endpoint() {
     let server = create_test_app().await;
-    
+
     // Create queue and add messages
     let create_request = CreateQueueRequest {
         name: "test_queue".to_string(),
         visibility_timeout_seconds: 120,
         enable_deduplication: false,
         deduplication_window_seconds: 300,
+        default_message_ttl_seconds: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
     
@@ -377,13 +384,14 @@ async fn test_purge_queue_endpoint() {
 #[tokio::test]
 async fn test_delete_queue_endpoint() {
     let server = create_test_app().await;
-    
+
     // Create a queue
     let create_request = CreateQueueRequest {
         name: "test_queue".to_string(),
         visibility_timeout_seconds: 120,
         enable_deduplication: false,
         deduplication_window_seconds: 300,
+        default_message_ttl_seconds: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
     
@@ -400,13 +408,14 @@ async fn test_delete_queue_endpoint() {
 #[tokio::test]
 async fn test_deduplication_endpoint() {
     let server = create_test_app().await;
-    
+
     // Create a queue with deduplication
     let create_request = CreateQueueRequest {
         name: "dedup_queue".to_string(),
         visibility_timeout_seconds: 120,
         enable_deduplication: true,
         deduplication_window_seconds: 300,
+        default_message_ttl_seconds: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
     
