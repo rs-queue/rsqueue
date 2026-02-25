@@ -37,7 +37,7 @@ async fn test_enqueue_dequeue() {
 
     let messages = queue.dequeue(1).messages;
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].content, "test message");
+    assert_eq!(messages[0].content.as_deref(), Some("test message"));
     assert_eq!(messages[0].id, id);
     assert!(messages[0].receipt_handle.is_some());
 
@@ -105,7 +105,7 @@ async fn test_visibility_timeout() {
     // Message should be available again
     let messages2 = queue.dequeue(1).messages;
     assert_eq!(messages2.len(), 1);
-    assert_eq!(messages2[0].content, "test message");
+    assert_eq!(messages2[0].content.as_deref(), Some("test message"));
 }
 
 #[tokio::test]
@@ -286,7 +286,7 @@ async fn test_get_messages_endpoint() {
     response.assert_status_ok();
     let messages: Vec<Message> = response.json();
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].content, "test message");
+    assert_eq!(messages[0].content.as_deref(), Some("test message"));
     assert!(messages[0].receipt_handle.is_some());
 }
 
@@ -559,9 +559,32 @@ async fn test_dlq_full_flow() {
     // Verify message is in DLQ
     assert_eq!(dlq.pending_count(), 1);
     let dlq_msgs = dlq.dequeue(1).messages;
-    assert_eq!(dlq_msgs[0].content, "poison message");
+    assert_eq!(dlq_msgs[0].content.as_deref(), Some("poison message"));
     assert_eq!(dlq_msgs[0].delivery_count, 3); // incremented when dequeued from DLQ
 
     // Source should be empty
     assert_eq!(source.size(), 0);
+}
+
+#[tokio::test]
+async fn test_in_memory_compression() {
+    let mut queue = Queue::new(
+        "compressed_queue".to_string(),
+        120, false, 300, None, None, None,
+    );
+    // Manually enable compression since our test constructor doesn't take it
+    queue.spec.enable_compression = true;
+
+    // Create a large, compressible payload
+    let large_payload = "A".repeat(10_000);
+    
+    let msg_id = queue.enqueue(large_payload.clone(), None, None, None).unwrap();
+    
+    // Dequeue and ensure it comes out exactly the same
+    let dequeue_result = queue.dequeue(1);
+    assert_eq!(dequeue_result.messages.len(), 1);
+    assert_eq!(dequeue_result.messages[0].id, msg_id);
+    assert_eq!(dequeue_result.messages[0].content.as_deref().unwrap(), &large_payload);
+    
+    // Check internal storage size if possible (optional, but we know the API works)
 }

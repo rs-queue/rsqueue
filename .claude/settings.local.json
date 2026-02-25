@@ -6,7 +6,12 @@
       "Bash(RUST_BACKTRACE=1 cargo test test_create_queue_endpoint -- --nocapture)",
       "Bash(cargo test:*)",
       "Bash(cargo:*)",
-      "Bash(mkdir:*)"
+      "Bash(mkdir:*)",
+      "WebSearch",
+      "Bash(curl:*)",
+      "Bash(taskkill:*)",
+      "Bash(rustc:*)",
+      "Bash(targetreleasersqueue.exe)"
     ],
     "deny": [],
     "defaultMode": "acceptEdits"

@@ -207,7 +207,12 @@ lazy_static::lazy_static! {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Message {
     pub id: Uuid,
-    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip)]
+    pub compressed_content: Option<Vec<u8>>,
+    #[serde(default)]
+    pub is_compressed: bool,
     pub content_hash: String, // SHA-256 hash of content for deduplication
     pub created_at: DateTime<Utc>,
     #[serde(default)]
@@ -224,6 +229,36 @@ pub struct Message {
     pub delivery_count: u32, // Incremented each time message is dequeued
 }
 
+impl Message {
+    pub fn decompressed(mut self) -> Self {
+        if self.is_compressed {
+            if let Some(compressed) = self.compressed_content.take() {
+                if let Ok(decompressed_bytes) = zstd::stream::decode_all(compressed.as_slice()) {
+                    if let Ok(content_str) = String::from_utf8(decompressed_bytes) {
+                        self.content = Some(content_str);
+                    }
+                }
+            }
+            self.is_compressed = false;
+        }
+        self
+    }
+
+    pub fn get_content_string(&self) -> String {
+        if let Some(content) = &self.content {
+            return content.clone();
+        }
+        if let Some(compressed) = &self.compressed_content {
+            if let Ok(decompressed_bytes) = zstd::stream::decode_all(compressed.as_slice()) {
+                if let Ok(content_str) = String::from_utf8(decompressed_bytes) {
+                    return content_str;
+                }
+            }
+        }
+        String::new()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QueueSpec {
     pub name: String,
@@ -232,6 +267,8 @@ pub struct QueueSpec {
     pub enable_deduplication: bool,
     pub deduplication_window_seconds: u64, // How long to remember message hashes
     pub default_message_ttl_seconds: Option<u64>, // Queue-level default TTL for messages
+    #[serde(default)]
+    pub enable_compression: bool, // In-memory compression for messages
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dead_letter_queue: Option<String>, // Target DLQ name
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -397,6 +434,7 @@ impl Queue {
                 enable_deduplication,
                 deduplication_window_seconds,
                 default_message_ttl_seconds,
+                enable_compression: false,
                 dead_letter_queue,
                 max_receive_count,
             },
@@ -530,9 +568,24 @@ impl Queue {
         // Clamp priority to 0-9 range
         let priority = priority.unwrap_or(0).min(9);
 
+        let is_compressed = self.spec.enable_compression;
+        let (stored_content, compressed_content) = if is_compressed {
+            match zstd::stream::encode_all(content.as_bytes(), 0) {
+                Ok(compressed) => (None, Some(compressed)),
+                Err(e) => {
+                    tracing::error!("Failed to compress message: {}", e);
+                    (Some(content), None)
+                }
+            }
+        } else {
+            (Some(content), None)
+        };
+
         let message = Message {
             id: Uuid::new_v4(),
-            content,
+            is_compressed: compressed_content.is_some(),
+            content: stored_content,
+            compressed_content,
             content_hash,
             created_at: Utc::now(),
             priority,
@@ -592,7 +645,7 @@ impl Queue {
                 if has_dlq {
                     if let Some(max_count) = max_receive_count {
                         if msg.delivery_count >= max_count {
-                            dlq_messages.push(msg);
+                            dlq_messages.push(msg.decompressed());
                             continue;
                         }
                     }
@@ -644,7 +697,7 @@ impl Queue {
                     msg.receipt_handle = Some(receipt_handle);
                     msg.visible_after = Some(now + visibility_timeout);
                     messages_to_flight.push((receipt_handle, msg.clone()));
-                    result.push(msg);
+                    result.push(msg.decompressed());
                     MESSAGES_DEQUEUED_TOTAL.inc();
                 } else {
                     break;
@@ -739,11 +792,11 @@ impl Queue {
     pub fn total_bytes(&self) -> usize {
         // Calculate total bytes from all messages in queue (pending + in-flight)
         let pending_bytes: usize = self.iter_all_pending()
-            .map(|msg| msg.content.len())
+            .map(|msg| msg.get_content_string().len())
             .sum();
 
         let in_flight_bytes: usize = self.in_flight.values()
-            .map(|msg| msg.content.len())
+            .map(|msg| msg.get_content_string().len())
             .sum();
 
         pending_bytes + in_flight_bytes
@@ -774,7 +827,7 @@ impl Queue {
             .take(count)
             .map(|msg| MessagePreview {
                 id: msg.id,
-                content: msg.content.clone(),
+                content: msg.get_content_string(),
                 created_at: msg.created_at,
                 priority: msg.priority,
                 status: MessageStatus::Pending,
@@ -801,7 +854,7 @@ impl Queue {
                 .take(remaining)
                 .map(|msg| MessagePreview {
                     id: msg.id,
-                    content: msg.content.clone(),
+                    content: msg.get_content_string(),
                     created_at: msg.created_at,
                     priority: msg.priority,
                     status: MessageStatus::InFlight,
@@ -824,7 +877,7 @@ impl Queue {
         for msg in self.iter_all_pending() {
             result.push(MessagePreview {
                 id: msg.id,
-                content: msg.content.clone(),
+                content: msg.get_content_string(),
                 created_at: msg.created_at,
                 priority: msg.priority,
                 status: MessageStatus::Pending,
@@ -838,7 +891,7 @@ impl Queue {
         for msg in self.in_flight.values() {
             result.push(MessagePreview {
                 id: msg.id,
-                content: msg.content.clone(),
+                content: msg.get_content_string(),
                 created_at: msg.created_at,
                 priority: msg.priority,
                 status: MessageStatus::InFlight,
@@ -2076,7 +2129,7 @@ mod tests {
 
         // Verify the correct messages remain
         let remaining_contents: Vec<String> = queue.iter_all_pending()
-            .map(|m| m.content.clone())
+            .map(|m| m.get_content_string())
             .collect();
 
         assert!(remaining_contents.contains(&"Should persist".to_string()));
@@ -2128,13 +2181,13 @@ mod tests {
         // Verify TTL settings
         assert_eq!(queue.pending_count(), 3);
 
-        let msg1 = queue.iter_all_pending().find(|m| m.content == "Message 1").unwrap();
+        let msg1 = queue.iter_all_pending().find(|m| m.content.as_deref() == Some("Message 1")).unwrap();
         assert!(msg1.expires_at.is_some());
 
-        let msg2 = queue.iter_all_pending().find(|m| m.content == "Message 2").unwrap();
+        let msg2 = queue.iter_all_pending().find(|m| m.content.as_deref() == Some("Message 2")).unwrap();
         assert!(msg2.expires_at.is_none());
 
-        let msg3 = queue.iter_all_pending().find(|m| m.content == "Message 3").unwrap();
+        let msg3 = queue.iter_all_pending().find(|m| m.content.as_deref() == Some("Message 3")).unwrap();
         assert!(msg3.expires_at.is_some());
     }
 
@@ -2153,7 +2206,9 @@ mod tests {
         // Create a message that has already expired
         let mut expired_msg = Message {
             id: Uuid::new_v4(),
-            content: "Already expired".to_string(),
+            is_compressed: false,
+            compressed_content: None,
+            content: Some("Already expired".to_string()),
             content_hash: Queue::compute_content_hash("Already expired"),
             created_at: Utc::now() - Duration::seconds(100),
             priority: 0,
@@ -2167,7 +2222,9 @@ mod tests {
         // Create a valid message
         let valid_msg = Message {
             id: Uuid::new_v4(),
-            content: "Valid message".to_string(),
+            is_compressed: false,
+            compressed_content: None,
+            content: Some("Valid message".to_string()),
             content_hash: Queue::compute_content_hash("Valid message"),
             created_at: Utc::now(),
             priority: 0,
@@ -2194,7 +2251,7 @@ mod tests {
 
         // Should only get the valid message
         assert_eq!(dequeued.len(), 1);
-        assert_eq!(dequeued[0].content, "Valid message");
+        assert_eq!(dequeued[0].content.as_deref(), Some("Valid message"));
 
         // Expired message should be removed from in-flight
         assert_eq!(queue.in_flight.len(), 1); // The valid message is now in-flight
@@ -2255,14 +2312,14 @@ mod tests {
         // Try to dequeue - should only get immediate message
         let messages = queue.dequeue(10).messages;
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].content, "Immediate message");
+        assert_eq!(messages[0].content.as_deref(), Some("Immediate message"));
 
         // Delayed message should still be in queue
         assert_eq!(queue.pending_count(), 1);
 
         // Verify delayed message has delivery_after set
         let delayed_msg = queue.iter_all_pending().next().unwrap();
-        assert_eq!(delayed_msg.content, "Delayed message");
+        assert_eq!(delayed_msg.content.as_deref(), Some("Delayed message"));
         assert!(delayed_msg.delivery_after.is_some());
     }
 
@@ -2356,11 +2413,11 @@ mod tests {
         // Dequeue should return highest priority first
         let messages = queue.dequeue(3).messages;
         assert_eq!(messages.len(), 3);
-        assert_eq!(messages[0].content, "high priority");
+        assert_eq!(messages[0].content.as_deref(), Some("high priority"));
         assert_eq!(messages[0].priority, 9);
-        assert_eq!(messages[1].content, "medium priority");
+        assert_eq!(messages[1].content.as_deref(), Some("medium priority"));
         assert_eq!(messages[1].priority, 5);
-        assert_eq!(messages[2].content, "low priority");
+        assert_eq!(messages[2].content.as_deref(), Some("low priority"));
         assert_eq!(messages[2].priority, 0);
     }
 
@@ -2373,9 +2430,9 @@ mod tests {
         queue.enqueue("third".to_string(), None, None, Some(5)).unwrap();
 
         let messages = queue.dequeue(3).messages;
-        assert_eq!(messages[0].content, "first");
-        assert_eq!(messages[1].content, "second");
-        assert_eq!(messages[2].content, "third");
+        assert_eq!(messages[0].content.as_deref(), Some("first"));
+        assert_eq!(messages[1].content.as_deref(), Some("second"));
+        assert_eq!(messages[2].content.as_deref(), Some("third"));
     }
 
     #[test]
@@ -2411,7 +2468,7 @@ mod tests {
         // Should get the low-priority immediate message since high-priority is delayed
         let messages = queue.dequeue(10).messages;
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].content, "low immediate");
+        assert_eq!(messages[0].content.as_deref(), Some("low immediate"));
 
         // Delayed message should still be in queue
         assert_eq!(queue.pending_count(), 1);
@@ -2435,7 +2492,7 @@ mod tests {
         // Dequeue again - priority should be preserved
         let messages2 = queue.dequeue(1).messages;
         assert_eq!(messages2[0].priority, 7);
-        assert_eq!(messages2[0].content, "high priority msg");
+        assert_eq!(messages2[0].content.as_deref(), Some("high priority msg"));
     }
 
     #[test]
@@ -2445,7 +2502,9 @@ mod tests {
         // Add expired message at priority 5
         let expired_msg = Message {
             id: Uuid::new_v4(),
-            content: "expired p5".to_string(),
+            is_compressed: false,
+            compressed_content: None,
+            content: Some("expired p5".to_string()),
             content_hash: Queue::compute_content_hash("expired p5"),
             created_at: Utc::now() - Duration::seconds(100),
             priority: 5,
@@ -2467,7 +2526,7 @@ mod tests {
         assert_eq!(queue.pending_count(), 1);
 
         let remaining = queue.iter_all_pending().next().unwrap();
-        assert_eq!(remaining.content, "valid p3");
+        assert_eq!(remaining.content.as_deref(), Some("valid p3"));
     }
 
     #[test]
@@ -2517,9 +2576,9 @@ mod tests {
         assert!(results.iter().all(|r| r.is_ok()));
 
         let messages = queue.dequeue(3).messages;
-        assert_eq!(messages[0].content, "high");
-        assert_eq!(messages[1].content, "medium");
-        assert_eq!(messages[2].content, "low");
+        assert_eq!(messages[0].content.as_deref(), Some("high"));
+        assert_eq!(messages[1].content.as_deref(), Some("medium"));
+        assert_eq!(messages[2].content.as_deref(), Some("low"));
     }
 
     #[test]
@@ -2629,7 +2688,7 @@ mod tests {
         assert_eq!(result3.messages.len(), 0);
         assert_eq!(result3.dlq_messages.len(), 1);
         assert_eq!(result3.dlq_messages[0].delivery_count, 2);
-        assert_eq!(result3.dlq_messages[0].content, "poison msg");
+        assert_eq!(result3.dlq_messages[0].content.as_deref(), Some("poison msg"));
     }
 
     #[test]

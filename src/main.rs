@@ -668,6 +668,7 @@ async fn main() {
                 // Note: Cannot use allow_credentials(true) with wildcard origins/headers
                 .max_age(Duration::from_secs(3600))
         )
+        .layer(tower_http::compression::CompressionLayer::new())
         .with_state(state.clone());
 
     // Apply authentication middleware if configured

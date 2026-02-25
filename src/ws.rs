@@ -328,7 +328,7 @@ async fn handle_client_message(
                         if let Some(dlq) = queues.get_mut(dlq_name) {
                             for dlq_msg in &result.dlq_messages {
                                 let _ = dlq.enqueue(
-                                    dlq_msg.content.clone(),
+                                    dlq_msg.get_content_string(),
                                     None,
                                     None,
                                     Some(dlq_msg.priority),

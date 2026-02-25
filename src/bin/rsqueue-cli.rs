@@ -44,6 +44,10 @@ enum Commands {
         #[arg(short = 'w', long, default_value = "300")]
         dedup_window: u64,
 
+        /// Enable in-memory message compression
+        #[arg(long)]
+        compress: bool,
+
         /// Dead letter queue name
         #[arg(long)]
         dlq: Option<String>,
@@ -166,6 +170,7 @@ fn main() {
             visibility_timeout,
             dedup,
             dedup_window,
+            compress,
             dlq,
             max_receive_count,
         } => create_queue(
@@ -177,6 +182,7 @@ fn main() {
             visibility_timeout,
             dedup,
             dedup_window,
+            compress,
             dlq.as_deref(),
             max_receive_count,
         ),
@@ -313,6 +319,7 @@ fn create_queue(
     visibility_timeout: u64,
     dedup: bool,
     dedup_window: u64,
+    compress: bool,
     dlq: Option<&str>,
     max_receive_count: Option<u32>,
 ) -> Result<(), String> {
@@ -322,6 +329,7 @@ fn create_queue(
         "visibility_timeout_seconds": visibility_timeout,
         "enable_deduplication": dedup,
         "deduplication_window_seconds": dedup_window,
+        "enable_compression": compress,
     });
 
     if let Some(dlq_name) = dlq {
