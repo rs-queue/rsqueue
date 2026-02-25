@@ -39,6 +39,7 @@ struct MetricsSummary {
     messages_deleted_total: u64,
     duplicate_messages_rejected_total: u64,
     messages_expired_total: u64,
+    messages_moved_to_dlq_total: u64,
     queues_created_total: u64,
     queues_deleted_total: u64,
     queues_purged_total: u64,
@@ -222,6 +223,7 @@ async fn get_metrics_summary() -> Json<MetricsSummary> {
         messages_deleted_total: get_messages_deleted_total(),
         duplicate_messages_rejected_total: get_duplicate_messages_rejected_total(),
         messages_expired_total: get_messages_expired_total(),
+        messages_moved_to_dlq_total: get_messages_moved_to_dlq_total(),
         queues_created_total: get_queues_created_total(),
         queues_deleted_total: get_queues_deleted_total(),
         queues_purged_total: get_queues_purged_total(),
@@ -375,6 +377,9 @@ async fn sse_queue_events(
                     QueueEvent::BatchDeleted { queue_name: qn, .. } => *qn == queue_name,
                     QueueEvent::QueuePurged { queue_name: qn, .. } => *qn == queue_name,
                     QueueEvent::QueueDeleted { queue_name: qn, .. } => *qn == queue_name,
+                    QueueEvent::MessageMovedToDLQ { source_queue, dlq_queue, .. } => {
+                        *source_queue == queue_name || *dlq_queue == queue_name
+                    }
                     QueueEvent::Heartbeat { .. } => true, // Always include heartbeats
                     QueueEvent::MetricsUpdate { .. } => true, // Always include metrics
                     QueueEvent::QueueCreated { .. } => false,

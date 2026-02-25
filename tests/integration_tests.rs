@@ -12,11 +12,11 @@ use std::{
 use uuid::Uuid;
 
 fn create_test_queue() -> Queue {
-    Queue::new("test_queue".to_string(), 120, false, 300, None)
+    Queue::new("test_queue".to_string(), 120, false, 300, None, None, None)
 }
 
 fn create_test_queue_with_dedup() -> Queue {
-    Queue::new("test_dedup_queue".to_string(), 120, true, 300, None)
+    Queue::new("test_dedup_queue".to_string(), 120, true, 300, None, None, None)
 }
 
 #[tokio::test]
@@ -35,7 +35,7 @@ async fn test_enqueue_dequeue() {
     let id = queue.enqueue("test message".to_string(), None, None, None).unwrap();
     assert_eq!(queue.size(), 1);
 
-    let messages = queue.dequeue(1);
+    let messages = queue.dequeue(1).messages;
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].content, "test message");
     assert_eq!(messages[0].id, id);
@@ -70,7 +70,7 @@ async fn test_deduplication() {
     assert!(result2.is_err());
     assert_eq!(queue.size(), 1);
 
-    let messages = queue.dequeue(2);
+    let messages = queue.dequeue(2).messages;
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].id, id1);
 }
@@ -80,7 +80,7 @@ async fn test_message_deletion() {
     let mut queue = create_test_queue();
 
     queue.enqueue("test message".to_string(), None, None, None).unwrap();
-    let messages = queue.dequeue(1);
+    let messages = queue.dequeue(1).messages;
     let receipt_handle = messages[0].receipt_handle.unwrap();
 
     assert_eq!(queue.size(), 1);
@@ -92,10 +92,10 @@ async fn test_message_deletion() {
 
 #[tokio::test]
 async fn test_visibility_timeout() {
-    let mut queue = Queue::new("test".to_string(), 1, false, 300, None); // 1 second timeout
+    let mut queue = Queue::new("test".to_string(), 1, false, 300, None, None, None); // 1 second timeout
 
     queue.enqueue("test message".to_string(), None, None, None).unwrap();
-    let messages = queue.dequeue(1);
+    let messages = queue.dequeue(1).messages;
     assert_eq!(messages.len(), 1);
     assert_eq!(queue.size(), 1); // In-flight
 
@@ -103,7 +103,7 @@ async fn test_visibility_timeout() {
     tokio::time::sleep(StdDuration::from_secs(2)).await;
 
     // Message should be available again
-    let messages2 = queue.dequeue(1);
+    let messages2 = queue.dequeue(1).messages;
     assert_eq!(messages2.len(), 1);
     assert_eq!(messages2[0].content, "test message");
 }
@@ -114,7 +114,7 @@ async fn test_queue_purge() {
 
     queue.enqueue("msg1".to_string(), None, None, None).unwrap();
     queue.enqueue("msg2".to_string(), None, None, None).unwrap();
-    let _messages = queue.dequeue(1);
+    let _messages = queue.dequeue(1).messages;
     assert_eq!(queue.size(), 2); // 1 pending + 1 in-flight
 
     queue.purge();
@@ -123,13 +123,13 @@ async fn test_queue_purge() {
 
 #[tokio::test]
 async fn test_visible_count() {
-    let mut queue = Queue::new("test".to_string(), 1, false, 300, None);
+    let mut queue = Queue::new("test".to_string(), 1, false, 300, None, None, None);
 
     queue.enqueue("msg1".to_string(), None, None, None).unwrap();
     queue.enqueue("msg2".to_string(), None, None, None).unwrap();
     assert_eq!(queue.get_visible_count(), 2);
 
-    queue.dequeue(1);
+    queue.dequeue(1).messages;
     assert_eq!(queue.get_visible_count(), 1); // 1 pending, 1 in-flight (not visible)
 
     // Wait for visibility timeout
@@ -175,6 +175,8 @@ async fn test_create_queue_endpoint() {
         enable_deduplication: false,
         deduplication_window_seconds: 600,
         default_message_ttl_seconds: None,
+        dead_letter_queue: None,
+        max_receive_count: None,
     };
     
     let response = server
@@ -199,6 +201,8 @@ async fn test_list_queues_endpoint() {
         enable_deduplication: false,
         deduplication_window_seconds: 300,
         default_message_ttl_seconds: None,
+        dead_letter_queue: None,
+        max_receive_count: None,
     };
 
     server.post("/queues").json(&request).await.assert_status_ok();
@@ -223,6 +227,8 @@ async fn test_enqueue_message_endpoint() {
         enable_deduplication: false,
         deduplication_window_seconds: 300,
         default_message_ttl_seconds: None,
+        dead_letter_queue: None,
+        max_receive_count: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
 
@@ -256,6 +262,8 @@ async fn test_get_messages_endpoint() {
         enable_deduplication: false,
         deduplication_window_seconds: 300,
         default_message_ttl_seconds: None,
+        dead_letter_queue: None,
+        max_receive_count: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
     
@@ -293,6 +301,8 @@ async fn test_delete_message_endpoint() {
         enable_deduplication: false,
         deduplication_window_seconds: 300,
         default_message_ttl_seconds: None,
+        dead_letter_queue: None,
+        max_receive_count: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
     
@@ -329,6 +339,8 @@ async fn test_batch_enqueue_endpoint() {
         enable_deduplication: false,
         deduplication_window_seconds: 300,
         default_message_ttl_seconds: None,
+        dead_letter_queue: None,
+        max_receive_count: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
     
@@ -364,6 +376,8 @@ async fn test_purge_queue_endpoint() {
         enable_deduplication: false,
         deduplication_window_seconds: 300,
         default_message_ttl_seconds: None,
+        dead_letter_queue: None,
+        max_receive_count: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
     
@@ -396,6 +410,8 @@ async fn test_delete_queue_endpoint() {
         enable_deduplication: false,
         deduplication_window_seconds: 300,
         default_message_ttl_seconds: None,
+        dead_letter_queue: None,
+        max_receive_count: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
     
@@ -420,6 +436,8 @@ async fn test_deduplication_endpoint() {
         enable_deduplication: true,
         deduplication_window_seconds: 300,
         default_message_ttl_seconds: None,
+        dead_letter_queue: None,
+        max_receive_count: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
     
@@ -441,4 +459,109 @@ async fn test_deduplication_endpoint() {
     let result2: EnqueueResponse = response2.json();
     assert!(result2.error.is_some());
     assert!(result2.error.unwrap().contains("Duplicate message detected"));
+}
+
+#[tokio::test]
+async fn test_create_queue_with_dlq_config() {
+    let server = create_test_app().await;
+
+    // Create the DLQ first
+    let dlq_request = CreateQueueRequest {
+        name: "my-dlq".to_string(),
+        visibility_timeout_seconds: 120,
+        enable_deduplication: false,
+        deduplication_window_seconds: 300,
+        default_message_ttl_seconds: None,
+        dead_letter_queue: None,
+        max_receive_count: None,
+    };
+    server.post("/queues").json(&dlq_request).await.assert_status_ok();
+
+    // Create a queue with DLQ config
+    let create_request = CreateQueueRequest {
+        name: "source-queue".to_string(),
+        visibility_timeout_seconds: 120,
+        enable_deduplication: false,
+        deduplication_window_seconds: 300,
+        default_message_ttl_seconds: None,
+        dead_letter_queue: Some("my-dlq".to_string()),
+        max_receive_count: Some(3),
+    };
+    let response = server.post("/queues").json(&create_request).await;
+    response.assert_status_ok();
+    let spec: QueueSpec = response.json();
+    assert_eq!(spec.dead_letter_queue, Some("my-dlq".to_string()));
+    assert_eq!(spec.max_receive_count, Some(3));
+}
+
+#[tokio::test]
+async fn test_create_queue_self_referential_dlq_rejected() {
+    let server = create_test_app().await;
+
+    let create_request = CreateQueueRequest {
+        name: "self-ref".to_string(),
+        visibility_timeout_seconds: 120,
+        enable_deduplication: false,
+        deduplication_window_seconds: 300,
+        default_message_ttl_seconds: None,
+        dead_letter_queue: Some("self-ref".to_string()),
+        max_receive_count: Some(3),
+    };
+    let response = server.post("/queues").json(&create_request).await;
+    response.assert_status(StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_dlq_full_flow() {
+    // Test: enqueue -> dequeue -> timeout -> dequeue -> timeout -> moved to DLQ
+    let mut source = Queue::new(
+        "source".to_string(), 1, false, 300, None,
+        Some("dlq".to_string()), Some(2),
+    );
+    let mut dlq = Queue::new("dlq".to_string(), 120, false, 300, None, None, None);
+
+    source.enqueue("poison message".to_string(), None, None, None).unwrap();
+
+    // First dequeue
+    let result1 = source.dequeue(1);
+    assert_eq!(result1.messages.len(), 1);
+    assert_eq!(result1.messages[0].delivery_count, 1);
+
+    // Simulate visibility timeout
+    let mut msg1 = result1.messages[0].clone();
+    let handle1 = msg1.receipt_handle.unwrap();
+    msg1.visible_after = Some(chrono::Utc::now() - chrono::Duration::seconds(10));
+    source.in_flight.insert(handle1, msg1);
+
+    // Second dequeue - re-queued then dequeued again
+    let result2 = source.dequeue(1);
+    assert_eq!(result2.messages.len(), 1);
+    assert_eq!(result2.messages[0].delivery_count, 2);
+
+    // Simulate visibility timeout again
+    let mut msg2 = result2.messages[0].clone();
+    let handle2 = msg2.receipt_handle.unwrap();
+    msg2.visible_after = Some(chrono::Utc::now() - chrono::Duration::seconds(10));
+    source.in_flight.insert(handle2, msg2);
+
+    // Third dequeue - should be flagged for DLQ
+    let result3 = source.dequeue(1);
+    assert_eq!(result3.messages.len(), 0);
+    assert_eq!(result3.dlq_messages.len(), 1);
+
+    // Move to DLQ (simulating what handler does)
+    for mut dlq_msg in result3.dlq_messages {
+        dlq_msg.receipt_handle = None;
+        dlq_msg.visible_after = None;
+        dlq.push_message(dlq_msg);
+    }
+
+    // Verify message is in DLQ
+    assert_eq!(dlq.pending_count(), 1);
+    let dlq_msgs = dlq.dequeue(1).messages;
+    assert_eq!(dlq_msgs[0].content, "poison message");
+    assert_eq!(dlq_msgs[0].delivery_count, 3); // incremented when dequeued from DLQ
+
+    // Source should be empty
+    assert_eq!(source.size(), 0);
 }

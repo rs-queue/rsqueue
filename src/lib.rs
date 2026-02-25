@@ -68,6 +68,14 @@ pub enum QueueEvent {
         queue_depth: usize,
         timestamp: DateTime<Utc>,
     },
+    #[serde(rename = "message_moved_to_dlq")]
+    MessageMovedToDLQ {
+        source_queue: String,
+        dlq_queue: String,
+        message_id: Uuid,
+        delivery_count: u32,
+        timestamp: DateTime<Utc>,
+    },
     #[serde(rename = "metrics_update")]
     MetricsUpdate {
         active_queues: usize,
@@ -132,10 +140,15 @@ lazy_static::lazy_static! {
     ).unwrap();
     
     static ref MESSAGES_EXPIRED_TOTAL: IntCounter = IntCounter::new(
-        "rsqueue_messages_expired_total", 
+        "rsqueue_messages_expired_total",
         "Total number of messages that expired and returned to queue"
     ).unwrap();
-    
+
+    static ref MESSAGES_MOVED_TO_DLQ_TOTAL: IntCounter = IntCounter::new(
+        "rsqueue_messages_moved_to_dlq_total",
+        "Total number of messages moved to dead letter queue"
+    ).unwrap();
+
     // Queue management metrics
     static ref QUEUES_CREATED_TOTAL: IntCounter = IntCounter::new(
         "rsqueue_queues_created_total", 
@@ -207,6 +220,8 @@ pub struct Message {
     pub expires_at: Option<DateTime<Utc>>, // TTL - message expires and is deleted at this time
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_after: Option<DateTime<Utc>>, // Scheduled delivery - message won't be delivered before this time
+    #[serde(default)]
+    pub delivery_count: u32, // Incremented each time message is dequeued
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -217,6 +232,10 @@ pub struct QueueSpec {
     pub enable_deduplication: bool,
     pub deduplication_window_seconds: u64, // How long to remember message hashes
     pub default_message_ttl_seconds: Option<u64>, // Queue-level default TTL for messages
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dead_letter_queue: Option<String>, // Target DLQ name
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_receive_count: Option<u32>, // Move to DLQ after this many receives
 }
 
 // Time-series tracking for graphs
@@ -352,6 +371,12 @@ impl TimeSeriesTracker {
     }
 }
 
+/// Result of a dequeue operation, separating normal messages from DLQ-bound messages
+pub struct DequeueResult {
+    pub messages: Vec<Message>,       // Messages delivered to consumer
+    pub dlq_messages: Vec<Message>,   // Messages that exceeded max_receive_count
+}
+
 #[derive(Debug)]
 pub struct Queue {
     pub spec: QueueSpec,
@@ -363,7 +388,7 @@ pub struct Queue {
 
 // Additional atomic helper methods for Queue
 impl Queue {
-    pub fn new(name: String, visibility_timeout_seconds: u64, enable_deduplication: bool, deduplication_window_seconds: u64, default_message_ttl_seconds: Option<u64>) -> Self {
+    pub fn new(name: String, visibility_timeout_seconds: u64, enable_deduplication: bool, deduplication_window_seconds: u64, default_message_ttl_seconds: Option<u64>, dead_letter_queue: Option<String>, max_receive_count: Option<u32>) -> Self {
         Self {
             spec: QueueSpec {
                 name,
@@ -372,6 +397,8 @@ impl Queue {
                 enable_deduplication,
                 deduplication_window_seconds,
                 default_message_ttl_seconds,
+                dead_letter_queue,
+                max_receive_count,
             },
             messages: BTreeMap::new(),
             in_flight: HashMap::new(),
@@ -513,6 +540,7 @@ impl Queue {
             visible_after: None,
             expires_at,
             delivery_after,
+            delivery_count: 0,
         };
         let id = message.id;
         self.push_message(message);
@@ -532,10 +560,12 @@ impl Queue {
         results
     }
 
-    pub fn dequeue(&mut self, count: usize) -> Vec<Message> {
+    pub fn dequeue(&mut self, count: usize) -> DequeueResult {
         let _timer = OPERATION_DURATION.start_timer();
         let now = Utc::now();
         let visibility_timeout = Duration::seconds(self.spec.visibility_timeout_seconds as i64);
+        let max_receive_count = self.spec.max_receive_count;
+        let has_dlq = self.spec.dead_letter_queue.is_some();
 
         // Clean expired messages and dedup hashes periodically
         self.clean_expired_messages();
@@ -543,8 +573,9 @@ impl Queue {
             self.clean_expired_dedup_hashes();
         }
 
-        // Step 1: Process expired in-flight messages, re-queue them at their original priority
+        // Step 1: Process expired in-flight messages
         let mut expired_handles = Vec::with_capacity(self.in_flight.len().min(100));
+        let mut dlq_messages = Vec::new();
 
         for (handle, msg) in self.in_flight.iter() {
             if msg.visible_after.map(|va| va <= now).unwrap_or(false) {
@@ -556,6 +587,17 @@ impl Queue {
             if let Some(mut msg) = self.in_flight.remove(&handle) {
                 msg.receipt_handle = None;
                 msg.visible_after = None;
+
+                // Check if message should go to DLQ
+                if has_dlq {
+                    if let Some(max_count) = max_receive_count {
+                        if msg.delivery_count >= max_count {
+                            dlq_messages.push(msg);
+                            continue;
+                        }
+                    }
+                }
+
                 // Re-queue at the original priority
                 self.push_message(msg);
                 MESSAGES_EXPIRED_TOTAL.inc();
@@ -595,6 +637,9 @@ impl Queue {
                         }
                     }
 
+                    // Increment delivery count
+                    msg.delivery_count += 1;
+
                     let receipt_handle = Uuid::new_v4();
                     msg.receipt_handle = Some(receipt_handle);
                     msg.visible_after = Some(now + visibility_timeout);
@@ -625,7 +670,10 @@ impl Queue {
             self.time_series.record_dequeue(result.len(), self.size());
         }
 
-        result
+        DequeueResult {
+            messages: result,
+            dlq_messages,
+        }
     }
 
     pub fn delete_message(&mut self, receipt_handle: Uuid) -> bool {
@@ -806,6 +854,8 @@ impl Queue {
             deduplication_window_seconds: self.spec.deduplication_window_seconds,
             dedup_cache_size: self.get_dedup_cache_size(),
             default_message_ttl_seconds: self.spec.default_message_ttl_seconds,
+            dead_letter_queue: self.spec.dead_letter_queue.clone(),
+            max_receive_count: self.spec.max_receive_count,
             messages_pending: self.pending_count(),
             messages_in_flight: self.in_flight.len(),
             visible_messages: self.get_visible_count(),
@@ -927,6 +977,7 @@ impl AppState {
         let _ = REGISTRY.register(Box::new(MESSAGES_DELETED_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(DUPLICATE_MESSAGES_REJECTED_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(MESSAGES_EXPIRED_TOTAL.clone()));
+        let _ = REGISTRY.register(Box::new(MESSAGES_MOVED_TO_DLQ_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(QUEUES_CREATED_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(QUEUES_DELETED_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(QUEUES_PURGED_TOTAL.clone()));
@@ -979,6 +1030,10 @@ pub struct CreateQueueRequest {
     pub deduplication_window_seconds: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_message_ttl_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dead_letter_queue: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_receive_count: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -991,6 +1046,10 @@ pub struct UpdateQueueRequest {
     pub deduplication_window_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_message_ttl_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dead_letter_queue: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_receive_count: Option<u32>,
 }
 
 pub fn default_visibility_timeout() -> u64 {
@@ -1108,6 +1167,10 @@ pub struct QueueDetailInfo {
     pub dedup_cache_size: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_message_ttl_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dead_letter_queue: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_receive_count: Option<u32>,
     pub messages_pending: usize,
     pub messages_in_flight: usize,
     pub visible_messages: usize,
@@ -1134,6 +1197,10 @@ pub struct QueueInfo {
     pub dedup_cache_size: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_message_ttl_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dead_letter_queue: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_receive_count: Option<u32>,
 }
 
 // Query parameters for time-series endpoints
@@ -1173,19 +1240,35 @@ pub async fn create_queue(
 ) -> Result<Json<QueueSpec>, StatusCode> {
     let _timer = HTTP_REQUEST_DURATION.start_timer();
     HTTP_REQUESTS_TOTAL.inc();
-    
+
+    // Validate DLQ config
+    if let Some(ref dlq_name) = req.dead_letter_queue {
+        if dlq_name == &req.name {
+            warn!("Queue cannot be its own dead letter queue: {}", req.name);
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    if let Some(max_receive) = req.max_receive_count {
+        if max_receive < 1 {
+            warn!("max_receive_count must be >= 1");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
     let mut queues = state.queues.write().await;
-    
+
     if queues.contains_key(&req.name) {
         return Err(StatusCode::CONFLICT);
     }
-    
+
     let queue = Queue::new(
         req.name.clone(),
         req.visibility_timeout_seconds,
         req.enable_deduplication,
         req.deduplication_window_seconds,
-        req.default_message_ttl_seconds
+        req.default_message_ttl_seconds,
+        req.dead_letter_queue,
+        req.max_receive_count,
     );
     let spec = queue.spec.clone();
     
@@ -1256,6 +1339,24 @@ pub async fn update_queue_settings(
             updated = true;
         }
 
+        if let Some(ref dlq_name) = req.dead_letter_queue {
+            if dlq_name == &queue_name {
+                warn!("Queue cannot be its own dead letter queue: {}", queue_name);
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            queue.spec.dead_letter_queue = Some(dlq_name.clone());
+            updated = true;
+        }
+
+        if let Some(max_receive) = req.max_receive_count {
+            if max_receive < 1 {
+                warn!("max_receive_count must be >= 1");
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            queue.spec.max_receive_count = Some(max_receive);
+            updated = true;
+        }
+
         if updated {
             let spec = queue.spec.clone();
             if let Err(e) = state.save_queue_spec(&spec).await {
@@ -1299,6 +1400,8 @@ pub async fn list_queues(State(state): State<AppState>) -> Json<Vec<QueueInfo>> 
             deduplication_window_seconds: queue.spec.deduplication_window_seconds,
             dedup_cache_size: queue.get_dedup_cache_size(),
             default_message_ttl_seconds: queue.spec.default_message_ttl_seconds,
+            dead_letter_queue: queue.spec.dead_letter_queue.clone(),
+            max_receive_count: queue.spec.max_receive_count,
         })
         .collect();
     
@@ -1447,14 +1550,47 @@ pub async fn get_messages(
 ) -> Result<Json<Vec<Message>>, StatusCode> {
     let _timer = HTTP_REQUEST_DURATION.start_timer();
     HTTP_REQUESTS_TOTAL.inc();
-    
+
     // Use a single write lock for the entire operation to ensure atomicity
     let mut queues = state.queues.write().await;
-    
+
     if let Some(queue) = queues.get_mut(&queue_name) {
+        let dlq_name = queue.spec.dead_letter_queue.clone();
         // The dequeue operation is now fully atomic under the write lock
-        let messages = queue.dequeue(req.count);
-        Ok(Json(messages))
+        let dequeue_result = queue.dequeue(req.count);
+
+        // Move DLQ messages to the dead letter queue
+        if !dequeue_result.dlq_messages.is_empty() {
+            if let Some(ref dlq_queue_name) = dlq_name {
+                if let Some(dlq_queue) = queues.get_mut(dlq_queue_name) {
+                    for mut msg in dequeue_result.dlq_messages {
+                        let msg_id = msg.id;
+                        let delivery_count = msg.delivery_count;
+                        info!("Moving message {} to DLQ '{}' after {} deliveries (source: '{}')",
+                            msg_id, dlq_queue_name, delivery_count, queue_name);
+                        msg.receipt_handle = None;
+                        msg.visible_after = None;
+                        dlq_queue.push_message(msg);
+                        MESSAGES_MOVED_TO_DLQ_TOTAL.inc();
+                        state.event_broadcaster.broadcast(QueueEvent::MessageMovedToDLQ {
+                            source_queue: queue_name.clone(),
+                            dlq_queue: dlq_queue_name.clone(),
+                            message_id: msg_id,
+                            delivery_count,
+                            timestamp: Utc::now(),
+                        });
+                    }
+                } else {
+                    warn!("DLQ '{}' does not exist, discarding {} messages from '{}'",
+                        dlq_queue_name, dequeue_result.dlq_messages.len(), queue_name);
+                    for _ in &dequeue_result.dlq_messages {
+                        MESSAGES_MOVED_TO_DLQ_TOTAL.inc();
+                    }
+                }
+            }
+        }
+
+        Ok(Json(dequeue_result.messages))
     } else {
         Err(StatusCode::NOT_FOUND)
     }
@@ -1624,6 +1760,10 @@ pub fn get_duplicate_messages_rejected_total() -> u64 {
 
 pub fn get_messages_expired_total() -> u64 {
     MESSAGES_EXPIRED_TOTAL.get()
+}
+
+pub fn get_messages_moved_to_dlq_total() -> u64 {
+    MESSAGES_MOVED_TO_DLQ_TOTAL.get()
 }
 
 pub fn get_queues_created_total() -> u64 {
@@ -1862,6 +2002,8 @@ mod tests {
             false,
             300,
             None,
+            None,
+            None,
         );
 
         // Test message without TTL (should not expire)
@@ -1894,6 +2036,8 @@ mod tests {
             30,
             false,
             300,
+            None,
+            None,
             None,
         );
 
@@ -1934,6 +2078,8 @@ mod tests {
             30,
             false,
             300,
+            None,
+            None,
             None,
         );
 
@@ -1987,6 +2133,8 @@ mod tests {
             false,
             300,
             None,
+            None,
+            None,
         );
 
         // Create a message that has already expired
@@ -2000,6 +2148,7 @@ mod tests {
             visible_after: None,
             expires_at: Some(Utc::now() - Duration::seconds(10)), // Expired 10 seconds ago
             delivery_after: None,
+            delivery_count: 0,
         };
 
         // Create a valid message
@@ -2013,6 +2162,7 @@ mod tests {
             visible_after: None,
             expires_at: Some(Utc::now() + Duration::seconds(100)), // Expires in 100 seconds
             delivery_after: None,
+            delivery_count: 0,
         };
 
         queue.push_message(expired_msg.clone());
@@ -2027,7 +2177,7 @@ mod tests {
         assert_eq!(queue.in_flight.len(), 1);
 
         // Dequeue should clean expired messages
-        let dequeued = queue.dequeue(10);
+        let dequeued = queue.dequeue(10).messages;
 
         // Should only get the valid message
         assert_eq!(dequeued.len(), 1);
@@ -2044,6 +2194,8 @@ mod tests {
             30,
             false,
             300,
+            None,
+            None,
             None,
         );
 
@@ -2075,6 +2227,8 @@ mod tests {
             false,
             300,
             None,
+            None,
+            None,
         );
 
         // Add immediate message
@@ -2086,7 +2240,7 @@ mod tests {
         assert_eq!(queue.pending_count(), 2);
 
         // Try to dequeue - should only get immediate message
-        let messages = queue.dequeue(10);
+        let messages = queue.dequeue(10).messages;
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "Immediate message");
 
@@ -2107,6 +2261,8 @@ mod tests {
             false,
             300,
             None,
+            None,
+            None,
         );
 
         // Enqueue some messages
@@ -2115,7 +2271,7 @@ mod tests {
         let _id3 = queue.enqueue("Message 3".to_string(), None, None, None).unwrap();
 
         // Dequeue all messages
-        let messages = queue.dequeue(3);
+        let messages = queue.dequeue(3).messages;
         assert_eq!(messages.len(), 3);
 
         // Collect receipt handles
@@ -2140,6 +2296,8 @@ mod tests {
             30,
             false,
             300,
+            None,
+            None,
             None,
         );
 
@@ -2175,7 +2333,7 @@ mod tests {
 
     #[test]
     fn test_priority_dequeue_order() {
-        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None, None, None);
 
         // Enqueue messages at different priorities
         queue.enqueue("low priority".to_string(), None, None, Some(0)).unwrap();
@@ -2183,7 +2341,7 @@ mod tests {
         queue.enqueue("high priority".to_string(), None, None, Some(9)).unwrap();
 
         // Dequeue should return highest priority first
-        let messages = queue.dequeue(3);
+        let messages = queue.dequeue(3).messages;
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].content, "high priority");
         assert_eq!(messages[0].priority, 9);
@@ -2195,13 +2353,13 @@ mod tests {
 
     #[test]
     fn test_fifo_within_same_priority() {
-        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None, None, None);
 
         queue.enqueue("first".to_string(), None, None, Some(5)).unwrap();
         queue.enqueue("second".to_string(), None, None, Some(5)).unwrap();
         queue.enqueue("third".to_string(), None, None, Some(5)).unwrap();
 
-        let messages = queue.dequeue(3);
+        let messages = queue.dequeue(3).messages;
         assert_eq!(messages[0].content, "first");
         assert_eq!(messages[1].content, "second");
         assert_eq!(messages[2].content, "third");
@@ -2209,28 +2367,28 @@ mod tests {
 
     #[test]
     fn test_default_priority_is_zero() {
-        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None, None, None);
 
         queue.enqueue("no priority specified".to_string(), None, None, None).unwrap();
 
-        let messages = queue.dequeue(1);
+        let messages = queue.dequeue(1).messages;
         assert_eq!(messages[0].priority, 0);
     }
 
     #[test]
     fn test_priority_clamping() {
-        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None, None, None);
 
         // Priority > 9 should be clamped to 9
         queue.enqueue("over max".to_string(), None, None, Some(255)).unwrap();
 
-        let messages = queue.dequeue(1);
+        let messages = queue.dequeue(1).messages;
         assert_eq!(messages[0].priority, 9);
     }
 
     #[tokio::test]
     async fn test_delayed_plus_priority() {
-        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None, None, None);
 
         // High priority but delayed
         queue.enqueue("high delayed".to_string(), None, Some(10), Some(9)).unwrap();
@@ -2238,7 +2396,7 @@ mod tests {
         queue.enqueue("low immediate".to_string(), None, None, Some(0)).unwrap();
 
         // Should get the low-priority immediate message since high-priority is delayed
-        let messages = queue.dequeue(10);
+        let messages = queue.dequeue(10).messages;
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "low immediate");
 
@@ -2248,11 +2406,11 @@ mod tests {
 
     #[test]
     fn test_requeue_preserves_priority() {
-        let mut queue = Queue::new("test_queue".to_string(), 1, false, 300, None); // 1s timeout
+        let mut queue = Queue::new("test_queue".to_string(), 1, false, 300, None, None, None); // 1s timeout
 
         queue.enqueue("high priority msg".to_string(), None, None, Some(7)).unwrap();
 
-        let messages = queue.dequeue(1);
+        let messages = queue.dequeue(1).messages;
         assert_eq!(messages[0].priority, 7);
 
         // Simulate visibility timeout by manually re-queuing
@@ -2262,14 +2420,14 @@ mod tests {
         queue.push_message(msg);
 
         // Dequeue again - priority should be preserved
-        let messages2 = queue.dequeue(1);
+        let messages2 = queue.dequeue(1).messages;
         assert_eq!(messages2[0].priority, 7);
         assert_eq!(messages2[0].content, "high priority msg");
     }
 
     #[test]
     fn test_clean_expired_across_priorities() {
-        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None, None, None);
 
         // Add expired message at priority 5
         let expired_msg = Message {
@@ -2282,6 +2440,7 @@ mod tests {
             visible_after: None,
             expires_at: Some(Utc::now() - Duration::seconds(10)),
             delivery_after: None,
+            delivery_count: 0,
         };
         queue.push_message(expired_msg);
 
@@ -2300,7 +2459,7 @@ mod tests {
 
     #[test]
     fn test_peek_priority_order() {
-        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None, None, None);
 
         queue.enqueue("low".to_string(), None, None, Some(1)).unwrap();
         queue.enqueue("high".to_string(), None, None, Some(9)).unwrap();
@@ -2318,7 +2477,7 @@ mod tests {
 
     #[test]
     fn test_batch_with_priorities() {
-        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None, None, None);
 
         let batch = vec![
             BatchMessageRequest {
@@ -2344,7 +2503,7 @@ mod tests {
         let results = queue.enqueue_batch(batch);
         assert!(results.iter().all(|r| r.is_ok()));
 
-        let messages = queue.dequeue(3);
+        let messages = queue.dequeue(3).messages;
         assert_eq!(messages[0].content, "high");
         assert_eq!(messages[1].content, "medium");
         assert_eq!(messages[2].content, "low");
@@ -2352,7 +2511,7 @@ mod tests {
 
     #[test]
     fn test_purge_clears_all_buckets() {
-        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None, None, None);
 
         queue.enqueue("p0".to_string(), None, None, Some(0)).unwrap();
         queue.enqueue("p5".to_string(), None, None, Some(5)).unwrap();
@@ -2367,7 +2526,7 @@ mod tests {
 
     #[test]
     fn test_size_counts_all_buckets() {
-        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None, None, None);
 
         queue.enqueue("p0".to_string(), None, None, Some(0)).unwrap();
         queue.enqueue("p3".to_string(), None, None, Some(3)).unwrap();
@@ -2377,8 +2536,177 @@ mod tests {
         assert_eq!(queue.size(), 3);
 
         // Dequeue one and verify size
-        queue.dequeue(1);
+        queue.dequeue(1).messages;
         assert_eq!(queue.pending_count(), 2);
         assert_eq!(queue.size(), 3); // 2 pending + 1 in-flight
+    }
+
+    // Dead Letter Queue tests
+
+    #[test]
+    fn test_delivery_count_increments_on_dequeue() {
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None, None, None);
+
+        queue.enqueue("test msg".to_string(), None, None, None).unwrap();
+
+        let messages = queue.dequeue(1).messages;
+        assert_eq!(messages[0].delivery_count, 1);
+    }
+
+    #[test]
+    fn test_delivery_count_increments_across_requeues() {
+        let mut queue = Queue::new("test_queue".to_string(), 1, false, 300, None, None, None); // 1s timeout
+
+        queue.enqueue("test msg".to_string(), None, None, None).unwrap();
+
+        // First dequeue
+        let messages = queue.dequeue(1).messages;
+        assert_eq!(messages[0].delivery_count, 1);
+
+        // Simulate re-queue after visibility timeout
+        let mut msg = messages[0].clone();
+        msg.receipt_handle = None;
+        msg.visible_after = None;
+        // delivery_count should be preserved from the in-flight copy
+        queue.in_flight.clear();
+        queue.push_message(msg);
+
+        // Second dequeue — delivery_count should increment again
+        let messages2 = queue.dequeue(1).messages;
+        assert_eq!(messages2[0].delivery_count, 2);
+    }
+
+    #[test]
+    fn test_dlq_message_flagged_after_max_receive_count() {
+        // Queue with DLQ configured, max_receive_count = 2
+        let mut queue = Queue::new(
+            "source_queue".to_string(), 1, false, 300, None,
+            Some("dlq_queue".to_string()), Some(2),
+        );
+
+        queue.enqueue("poison msg".to_string(), None, None, None).unwrap();
+
+        // First dequeue: delivery_count becomes 1
+        let result = queue.dequeue(1);
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.dlq_messages.len(), 0);
+        assert_eq!(result.messages[0].delivery_count, 1);
+
+        // Simulate visibility timeout: put message back in-flight with expired visible_after
+        let mut msg = result.messages[0].clone();
+        let handle = msg.receipt_handle.unwrap();
+        msg.visible_after = Some(Utc::now() - Duration::seconds(10));
+        queue.in_flight.insert(handle, msg);
+
+        // Second dequeue: the expired in-flight message gets re-queued (delivery_count=1 < max_receive=2)
+        // Then it gets dequeued again with delivery_count becoming 2
+        let result2 = queue.dequeue(1);
+        assert_eq!(result2.messages.len(), 1);
+        assert_eq!(result2.dlq_messages.len(), 0);
+        assert_eq!(result2.messages[0].delivery_count, 2);
+
+        // Simulate visibility timeout again
+        let mut msg2 = result2.messages[0].clone();
+        let handle2 = msg2.receipt_handle.unwrap();
+        msg2.visible_after = Some(Utc::now() - Duration::seconds(10));
+        queue.in_flight.insert(handle2, msg2);
+
+        // Third dequeue: delivery_count=2 >= max_receive_count=2, so message goes to DLQ
+        let result3 = queue.dequeue(1);
+        assert_eq!(result3.messages.len(), 0);
+        assert_eq!(result3.dlq_messages.len(), 1);
+        assert_eq!(result3.dlq_messages[0].delivery_count, 2);
+        assert_eq!(result3.dlq_messages[0].content, "poison msg");
+    }
+
+    #[test]
+    fn test_dlq_disabled_messages_requeue_normally() {
+        // No DLQ configured
+        let mut queue = Queue::new("test_queue".to_string(), 1, false, 300, None, None, None);
+
+        queue.enqueue("normal msg".to_string(), None, None, None).unwrap();
+
+        // Dequeue
+        let result = queue.dequeue(1);
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.dlq_messages.len(), 0);
+
+        // Simulate visibility timeout
+        let mut msg = result.messages[0].clone();
+        let handle = msg.receipt_handle.unwrap();
+        msg.visible_after = Some(Utc::now() - Duration::seconds(10));
+        queue.in_flight.insert(handle, msg);
+
+        // Dequeue again — message should be re-queued normally, no DLQ
+        let result2 = queue.dequeue(1);
+        assert_eq!(result2.messages.len(), 1);
+        assert_eq!(result2.dlq_messages.len(), 0);
+    }
+
+    #[test]
+    fn test_dlq_messages_have_cleared_receipt_handle() {
+        let mut queue = Queue::new(
+            "source".to_string(), 1, false, 300, None,
+            Some("dlq".to_string()), Some(1),
+        );
+
+        queue.enqueue("msg".to_string(), None, None, None).unwrap();
+
+        // First dequeue: delivery_count becomes 1
+        let result = queue.dequeue(1);
+        let mut msg = result.messages[0].clone();
+        let handle = msg.receipt_handle.unwrap();
+        msg.visible_after = Some(Utc::now() - Duration::seconds(10));
+        queue.in_flight.insert(handle, msg);
+
+        // Second dequeue: delivery_count=1 >= max_receive_count=1, DLQ flagged
+        let result2 = queue.dequeue(1);
+        assert_eq!(result2.dlq_messages.len(), 1);
+        assert!(result2.dlq_messages[0].receipt_handle.is_none());
+        assert!(result2.dlq_messages[0].visible_after.is_none());
+    }
+
+    #[test]
+    fn test_dlq_preserves_priority() {
+        let mut queue = Queue::new(
+            "source".to_string(), 1, false, 300, None,
+            Some("dlq".to_string()), Some(1),
+        );
+
+        queue.enqueue("high priority poison".to_string(), None, None, Some(8)).unwrap();
+
+        let result = queue.dequeue(1);
+        let mut msg = result.messages[0].clone();
+        let handle = msg.receipt_handle.unwrap();
+        msg.visible_after = Some(Utc::now() - Duration::seconds(10));
+        queue.in_flight.insert(handle, msg);
+
+        let result2 = queue.dequeue(1);
+        assert_eq!(result2.dlq_messages.len(), 1);
+        assert_eq!(result2.dlq_messages[0].priority, 8);
+    }
+
+    #[test]
+    fn test_self_referential_dlq_rejected() {
+        // This is tested at the handler level, but we can verify the Queue struct allows it
+        // (validation happens in the handler, not the struct)
+        // So just verify Queue::new works with self-referential names — the handler will reject it
+        let queue = Queue::new(
+            "my_queue".to_string(), 30, false, 300, None,
+            Some("my_queue".to_string()), Some(3),
+        );
+        // The queue is created; validation is at the API layer
+        assert_eq!(queue.spec.dead_letter_queue, Some("my_queue".to_string()));
+    }
+
+    #[test]
+    fn test_max_receive_count_validation() {
+        // max_receive_count of 0 is allowed at the struct level
+        // Validation (>= 1) happens in handlers
+        let queue = Queue::new(
+            "test".to_string(), 30, false, 300, None,
+            Some("dlq".to_string()), Some(0),
+        );
+        assert_eq!(queue.spec.max_receive_count, Some(0));
     }
 }

@@ -1,0 +1,7 @@
+{
+  "name": "test-queue",
+  "created_at": "2025-11-03T20:58:43.452285600Z",
+  "visibility_timeout_seconds": 30,
+  "enable_deduplication": false,
+  "deduplication_window_seconds": 300
+}

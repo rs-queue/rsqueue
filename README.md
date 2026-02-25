@@ -11,6 +11,7 @@ A high-performance, thread-safe message queue service written in Rust with HTTP 
 - ⏳ **Message TTL (Time To Live)**: Optional message expiration - messages automatically deleted after specified time
 - ⏰ **Delayed/Scheduled Messages**: Schedule messages for future delivery with delay_seconds parameter
 - 🔢 **Message Priorities**: Priority levels 0-9 (higher = higher priority), dequeued highest-first with FIFO within same level
+- 💀 **Dead Letter Queue**: Automatically move poison messages to a DLQ after configurable max receive count
 - 📝 **Persistent Queue Specs**: Queue configurations survive server restarts
 - 🔄 **Automatic Re-queueing**: Unprocessed messages automatically return to the queue
 - 📦 **Batch Operations**: Enqueue and delete multiple messages in a single request
@@ -164,7 +165,9 @@ rsqueue-cli delete-message task-queue 650e8400-e29b-41d4-a716-446655440001
   ```json
   {
     "name": "string",
-    "visibility_timeout_seconds": 120  // optional, defaults to 120
+    "visibility_timeout_seconds": 120,   // optional, defaults to 120
+    "dead_letter_queue": "dlq-name",     // optional, target DLQ queue name
+    "max_receive_count": 5               // optional, move to DLQ after N receives
   }
   ```
 - **Returns**: Queue specification
@@ -254,6 +257,8 @@ rsqueue-cli delete-message task-queue 650e8400-e29b-41d4-a716-446655440001
 - **`visibility_timeout_seconds`**: Duration (in seconds) that a message remains invisible after being retrieved. Default: 120 seconds (2 minutes)
 - **`enable_deduplication`**: Enable content-based message deduplication. Default: false
 - **`deduplication_window_seconds`**: How long to remember message hashes for deduplication. Default: 300 seconds (5 minutes)
+- **`dead_letter_queue`**: Name of the queue to move poison messages to after `max_receive_count` is exceeded. Default: none (disabled)
+- **`max_receive_count`**: Number of times a message can be received before being moved to the dead letter queue. Must be >= 1. Default: none (disabled)
 
 ### Message Options
 
@@ -439,7 +444,7 @@ MIT License - feel free to use this in your projects!
 - [x] Batch delete operations
 - [x] Queue statistics and performance tracking
 - [x] Implement message priorities
-- [ ] Add dead letter queue support
+- [x] Add dead letter queue support
 - [ ] Create distributed version with clustering
 - [ ] Add message compression
 - [ ] Implement persistence options (RocksDB, PostgreSQL)

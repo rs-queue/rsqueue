@@ -41,6 +41,14 @@ enum Commands {
         /// Deduplication window in seconds
         #[arg(short = 'w', long, default_value = "300")]
         dedup_window: u64,
+
+        /// Dead letter queue name
+        #[arg(long)]
+        dlq: Option<String>,
+
+        /// Max receive count before moving to DLQ
+        #[arg(long)]
+        max_receive_count: Option<u32>,
     },
 
     /// List all queues
@@ -135,6 +143,8 @@ fn main() {
             visibility_timeout,
             dedup,
             dedup_window,
+            dlq,
+            max_receive_count,
         } => create_queue(
             &client,
             &cli.url,
@@ -144,6 +154,8 @@ fn main() {
             visibility_timeout,
             dedup,
             dedup_window,
+            dlq.as_deref(),
+            max_receive_count,
         ),
 
         Commands::List => list_queues(
@@ -270,14 +282,23 @@ fn create_queue(
     visibility_timeout: u64,
     dedup: bool,
     dedup_window: u64,
+    dlq: Option<&str>,
+    max_receive_count: Option<u32>,
 ) -> Result<(), String> {
     let url = format!("{}/queues", base_url);
-    let body = json!({
+    let mut body = json!({
         "name": name,
         "visibility_timeout_seconds": visibility_timeout,
         "enable_deduplication": dedup,
         "deduplication_window_seconds": dedup_window,
     });
+
+    if let Some(dlq_name) = dlq {
+        body["dead_letter_queue"] = json!(dlq_name);
+    }
+    if let Some(count) = max_receive_count {
+        body["max_receive_count"] = json!(count);
+    }
 
     let response = build_request(client, reqwest::Method::POST, &url, user, password)
         .json(&body)
