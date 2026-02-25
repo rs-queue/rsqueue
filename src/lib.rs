@@ -687,6 +687,19 @@ impl Queue {
         deleted
     }
 
+    /// Nack a message: remove from in-flight and push back to the front of its priority bucket
+    /// for immediate re-delivery, without waiting for visibility timeout.
+    pub fn nack_message(&mut self, receipt_handle: Uuid) -> bool {
+        if let Some(mut msg) = self.in_flight.remove(&receipt_handle) {
+            msg.receipt_handle = None;
+            msg.visible_after = None;
+            self.push_front_message(msg);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn batch_delete_messages(&mut self, receipt_handles: Vec<Uuid>) -> Vec<DeleteResult> {
         // Preallocate with exact capacity for better performance
         let mut results = Vec::with_capacity(receipt_handles.len());

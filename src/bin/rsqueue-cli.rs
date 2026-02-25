@@ -1,7 +1,9 @@
 use clap::{Parser, Subcommand};
 use reqwest::blocking::Client;
 use serde_json::json;
+use std::io::{Read as _, Write as _};
 use std::process;
+use tungstenite::connect;
 
 #[derive(Parser)]
 #[command(name = "rsqueue-cli")]
@@ -131,6 +133,27 @@ enum Commands {
         #[arg(short, long, default_value = "0")]
         offset: usize,
     },
+
+    /// Listen to real-time events via WebSocket
+    Listen {
+        /// Subscribe to a specific queue (omit for all events)
+        #[arg(short, long)]
+        queue: Option<String>,
+    },
+
+    /// Consume messages via WebSocket with interactive ack/nack
+    WsConsume {
+        /// Name of the queue to consume from
+        queue: String,
+
+        /// Number of messages per consume request
+        #[arg(short, long, default_value = "1")]
+        count: usize,
+
+        /// Automatically ack messages after printing
+        #[arg(long)]
+        auto_ack: bool,
+    },
 }
 
 fn main() {
@@ -249,6 +272,14 @@ fn main() {
             count,
             offset,
         ),
+
+        Commands::Listen { queue } => ws_listen(&cli.url, queue.as_deref()),
+
+        Commands::WsConsume {
+            queue,
+            count,
+            auto_ack,
+        } => ws_consume(&cli.url, &queue, count, auto_ack),
     };
 
     if let Err(e) = result {
@@ -567,4 +598,185 @@ fn peek_messages(
             response.status()
         ))
     }
+}
+
+fn http_to_ws_url(http_url: &str) -> String {
+    http_url
+        .replacen("https://", "wss://", 1)
+        .replacen("http://", "ws://", 1)
+}
+
+fn ws_listen(base_url: &str, queue: Option<&str>) -> Result<(), String> {
+    let ws_base = http_to_ws_url(base_url);
+    let ws_url = match queue {
+        Some(q) => format!("{}/queues/{}/ws", ws_base, q),
+        None => format!("{}/ws", ws_base),
+    };
+
+    let (mut socket, _response) =
+        connect(&ws_url).map_err(|e| format!("WebSocket connection failed: {}", e))?;
+
+    // If global endpoint and no queue specified, subscribe to all
+    if queue.is_none() {
+        let sub_msg = json!({"type": "subscribe_all"});
+        socket
+            .send(tungstenite::Message::Text(sub_msg.to_string().into()))
+            .map_err(|e| format!("Failed to send subscribe: {}", e))?;
+    }
+
+    eprintln!("Connected. Listening for events... (Ctrl+C to stop)");
+
+    loop {
+        match socket.read() {
+            Ok(tungstenite::Message::Text(text)) => {
+                // Pretty-print if valid JSON, otherwise raw
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                    println!("{}", serde_json::to_string_pretty(&val).unwrap());
+                } else {
+                    println!("{}", text);
+                }
+            }
+            Ok(tungstenite::Message::Close(_)) => {
+                eprintln!("Server closed connection");
+                break;
+            }
+            Err(e) => {
+                return Err(format!("WebSocket error: {}", e));
+            }
+            _ => {} // ignore binary, ping/pong
+        }
+    }
+
+    Ok(())
+}
+
+fn ws_consume(base_url: &str, queue: &str, count: usize, auto_ack: bool) -> Result<(), String> {
+    let ws_base = http_to_ws_url(base_url);
+    let ws_url = format!("{}/queues/{}/ws", ws_base, queue);
+
+    let (mut socket, _response) =
+        connect(&ws_url).map_err(|e| format!("WebSocket connection failed: {}", e))?;
+
+    // Read the connected message
+    if let Ok(tungstenite::Message::Text(text)) = socket.read() {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+            eprintln!(
+                "Connected to server v{}",
+                val.get("server_version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+            );
+        }
+    }
+
+    // Read the auto-subscribed message
+    let _ = socket.read();
+
+    loop {
+        // Send consume request
+        let consume_msg = json!({
+            "type": "consume",
+            "queue_name": queue,
+            "count": count,
+        });
+        socket
+            .send(tungstenite::Message::Text(consume_msg.to_string().into()))
+            .map_err(|e| format!("Failed to send consume: {}", e))?;
+
+        // Read response
+        match socket.read() {
+            Ok(tungstenite::Message::Text(text)) => {
+                let val: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| format!("Invalid JSON: {}", e))?;
+
+                let msg_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+                if msg_type == "messages" {
+                    let messages = val.get("messages").and_then(|m| m.as_array());
+                    if let Some(msgs) = messages {
+                        if msgs.is_empty() {
+                            eprintln!("No messages available. Waiting 2s...");
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            continue;
+                        }
+
+                        for msg in msgs {
+                            println!("{}", serde_json::to_string_pretty(msg).unwrap());
+
+                            if let Some(receipt_handle) = msg.get("receipt_handle").and_then(|r| r.as_str()) {
+                                if auto_ack {
+                                    let ack_msg = json!({
+                                        "type": "ack",
+                                        "queue_name": queue,
+                                        "receipt_handle": receipt_handle,
+                                    });
+                                    socket
+                                        .send(tungstenite::Message::Text(ack_msg.to_string().into()))
+                                        .map_err(|e| format!("Failed to send ack: {}", e))?;
+                                    // Read ack response
+                                    let _ = socket.read();
+                                    eprintln!("  -> auto-acked {}", receipt_handle);
+                                } else {
+                                    eprint!("  [a]ck / [n]ack / [s]kip? ");
+                                    std::io::stderr().flush().ok();
+                                    let mut input = [0u8; 1];
+                                    if std::io::stdin().read(&mut input).is_ok() {
+                                        // Consume rest of line
+                                        let mut rest = String::new();
+                                        let _ = std::io::stdin().read_line(&mut rest);
+
+                                        match input[0] {
+                                            b'a' | b'A' => {
+                                                let ack_msg = json!({
+                                                    "type": "ack",
+                                                    "queue_name": queue,
+                                                    "receipt_handle": receipt_handle,
+                                                });
+                                                socket
+                                                    .send(tungstenite::Message::Text(ack_msg.to_string().into()))
+                                                    .map_err(|e| format!("Failed to send ack: {}", e))?;
+                                                let _ = socket.read();
+                                                eprintln!("  -> acked");
+                                            }
+                                            b'n' | b'N' => {
+                                                let nack_msg = json!({
+                                                    "type": "nack",
+                                                    "queue_name": queue,
+                                                    "receipt_handle": receipt_handle,
+                                                });
+                                                socket
+                                                    .send(tungstenite::Message::Text(nack_msg.to_string().into()))
+                                                    .map_err(|e| format!("Failed to send nack: {}", e))?;
+                                                let _ = socket.read();
+                                                eprintln!("  -> nacked (returned to queue)");
+                                            }
+                                            _ => {
+                                                eprintln!("  -> skipped (will return after visibility timeout)");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if msg_type == "error" {
+                    let err_msg = val.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
+                    eprintln!("Error: {}", err_msg);
+                } else if msg_type == "pong" {
+                    // heartbeat, ignore and retry consume
+                    continue;
+                }
+            }
+            Ok(tungstenite::Message::Close(_)) => {
+                eprintln!("Server closed connection");
+                break;
+            }
+            Err(e) => {
+                return Err(format!("WebSocket error: {}", e));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
 }

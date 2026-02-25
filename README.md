@@ -396,6 +396,90 @@ rsqueue-cli receive notifications --count 10
 - **Scalability**: Single-node design, suitable for millions of messages depending on message size and available RAM
 - **Concurrency**: Optimized for high-concurrency scenarios with multiple producers/consumers
 
+## WebSocket API
+
+RSQueue supports bidirectional real-time communication via WebSocket. Clients can subscribe to events, consume messages, and ack/nack — all over a single persistent connection.
+
+### Endpoints
+
+| Route | Purpose |
+|-------|---------|
+| `GET /ws` | Global WebSocket — starts with no subscriptions, client opts in |
+| `GET /queues/{name}/ws` | Queue-scoped — auto-subscribed to that queue, commands restricted to it |
+
+### Client → Server Messages (JSON)
+
+```jsonc
+// Subscribe to all events (global endpoint only)
+{"type": "subscribe_all"}
+
+// Subscribe to a specific queue's events
+{"type": "subscribe_queue", "queue_name": "my-queue"}
+
+// Unsubscribe from a queue
+{"type": "unsubscribe_queue", "queue_name": "my-queue"}
+
+// Consume messages (dequeue)
+{"type": "consume", "queue_name": "my-queue", "count": 5}
+
+// Acknowledge a processed message (deletes it)
+{"type": "ack", "queue_name": "my-queue", "receipt_handle": "uuid-here"}
+
+// Nack a message (return to queue immediately for re-delivery)
+{"type": "nack", "queue_name": "my-queue", "receipt_handle": "uuid-here"}
+
+// Application-level keepalive
+{"type": "ping"}
+```
+
+### Server → Client Messages (JSON)
+
+- `connected` — sent on connection with `server_version` and `timestamp`
+- `event` — forwarded queue event (same events as SSE)
+- `messages` — response to `consume` with `messages[]` and `dlq_messages_moved`
+- `ack_ok` / `nack_ok` — confirmation responses
+- `subscribed` / `unsubscribed` — subscription confirmations
+- `error` — error with `code`, `message`, and optional `request_type`
+- `pong` — response to `ping` and automatic heartbeat every 30s
+
+### CLI WebSocket Commands
+
+```bash
+# Listen to all events in real-time
+rsqueue-cli listen
+
+# Listen to events for a specific queue
+rsqueue-cli listen --queue my-queue
+
+# Consume messages interactively (ack/nack/skip each message)
+rsqueue-cli ws-consume my-queue
+
+# Consume with auto-ack (print and acknowledge immediately)
+rsqueue-cli ws-consume my-queue --auto-ack
+
+# Consume multiple messages at once
+rsqueue-cli ws-consume my-queue --count 5 --auto-ack
+```
+
+### Example Session (websocat)
+
+```bash
+$ websocat ws://localhost:4000/ws
+< {"type":"connected","server_version":"0.1.0","timestamp":"..."}
+
+> {"type":"subscribe_all"}
+< {"type":"subscribed","scope":"all"}
+
+# (create a queue via REST in another terminal)
+< {"type":"event","event":{"type":"queue_created","queue_name":"test","timestamp":"..."}}
+
+> {"type":"consume","queue_name":"test","count":1}
+< {"type":"messages","queue_name":"test","messages":[...],"dlq_messages_moved":0}
+
+> {"type":"ack","queue_name":"test","receipt_handle":"..."}
+< {"type":"ack_ok","queue_name":"test","receipt_handle":"..."}
+```
+
 ## Development
 
 ### Running Tests
@@ -448,7 +532,7 @@ MIT License - feel free to use this in your projects!
 - [ ] Create distributed version with clustering
 - [ ] Add message compression
 - [ ] Implement persistence options (RocksDB, PostgreSQL)
-- [ ] WebSocket support for real-time message streaming
+- [x] WebSocket support for real-time message streaming
 
 ## Support
 

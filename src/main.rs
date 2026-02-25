@@ -11,6 +11,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use futures::stream::Stream;
 use prometheus::{TextEncoder, Encoder};
+mod ws;
 use rsqueue::*;
 use serde::Serialize;
 use std::{convert::Infallible, path::PathBuf, time::{Duration, SystemTime}};
@@ -625,6 +626,10 @@ async fn main() {
         // SSE endpoints for real-time updates
         .route("/events", get(sse_events))
         .route("/queues/:name/events", get(sse_queue_events))
+
+        // WebSocket endpoints
+        .route("/ws", get(ws::ws_handler))
+        .route("/queues/:name/ws", get(ws::ws_queue_handler))
 
         // Queue management (with event broadcasting)
         .route("/queues", post(create_queue_with_events))
