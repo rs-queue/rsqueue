@@ -42,6 +42,7 @@ pub enum QueueEvent {
     MessageEnqueued {
         queue_name: String,
         message_id: Uuid,
+        priority: u8,
         queue_depth: usize,
         timestamp: DateTime<Utc>,
     },
@@ -196,6 +197,8 @@ pub struct Message {
     pub content: String,
     pub content_hash: String, // SHA-256 hash of content for deduplication
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub priority: u8, // 0-9, higher = higher priority, default 0
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receipt_handle: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -352,7 +355,7 @@ impl TimeSeriesTracker {
 #[derive(Debug)]
 pub struct Queue {
     pub spec: QueueSpec,
-    pub messages: VecDeque<Message>,
+    pub messages: BTreeMap<u8, VecDeque<Message>>, // priority -> FIFO bucket (higher priority = dequeued first)
     pub in_flight: HashMap<Uuid, Message>, // receipt_handle -> Message
     pub dedup_hashes: HashMap<String, DateTime<Utc>>, // content_hash -> expiry time
     pub time_series: TimeSeriesTracker, // Track message events over time
@@ -370,11 +373,33 @@ impl Queue {
                 deduplication_window_seconds,
                 default_message_ttl_seconds,
             },
-            messages: VecDeque::new(),
+            messages: BTreeMap::new(),
             in_flight: HashMap::new(),
             dedup_hashes: HashMap::new(),
             time_series: TimeSeriesTracker::new(24), // Keep 24 hours of history by default
         }
+    }
+
+    /// Count of all pending messages across all priority buckets
+    pub fn pending_count(&self) -> usize {
+        self.messages.values().map(|bucket| bucket.len()).sum()
+    }
+
+    /// Iterate all pending messages in priority order (highest first), FIFO within each priority
+    pub fn iter_all_pending(&self) -> impl Iterator<Item = &Message> {
+        self.messages.iter().rev().flat_map(|(_, bucket)| bucket.iter())
+    }
+
+    /// Push a message into the correct priority bucket
+    pub fn push_message(&mut self, msg: Message) {
+        let priority = msg.priority;
+        self.messages.entry(priority).or_default().push_back(msg);
+    }
+
+    /// Push a message to the front of its priority bucket (for re-queuing delayed messages)
+    pub fn push_front_message(&mut self, msg: Message) {
+        let priority = msg.priority;
+        self.messages.entry(priority).or_default().push_front(msg);
     }
 
     pub fn compute_content_hash(content: &str) -> String {
@@ -393,24 +418,25 @@ impl Queue {
     // Returns the number of messages removed
     pub fn clean_expired_messages(&mut self) -> usize {
         let now = Utc::now();
-        let initial_count = self.messages.len();
+        let initial_count = self.pending_count();
         let initial_in_flight = self.in_flight.len();
         let default_ttl = self.spec.default_message_ttl_seconds;
 
-        // Remove expired messages from the main queue
-        self.messages.retain(|msg| {
-            if let Some(expires_at) = msg.expires_at {
-                // Message has explicit TTL - use it
-                expires_at > now
-            } else if let Some(ttl_seconds) = default_ttl {
-                // Message has no explicit TTL but queue has default TTL
-                // Apply retroactively based on message creation time
-                let effective_expires_at = msg.created_at + Duration::seconds(ttl_seconds as i64);
-                effective_expires_at > now
-            } else {
-                true // No TTL configured - message never expires
-            }
-        });
+        // Remove expired messages from each priority bucket
+        for bucket in self.messages.values_mut() {
+            bucket.retain(|msg| {
+                if let Some(expires_at) = msg.expires_at {
+                    expires_at > now
+                } else if let Some(ttl_seconds) = default_ttl {
+                    let effective_expires_at = msg.created_at + Duration::seconds(ttl_seconds as i64);
+                    effective_expires_at > now
+                } else {
+                    true
+                }
+            });
+        }
+        // Remove empty buckets
+        self.messages.retain(|_, bucket| !bucket.is_empty());
 
         // Remove expired messages from in-flight
         let expired_in_flight: Vec<Uuid> = self.in_flight
@@ -434,7 +460,7 @@ impl Queue {
         }
 
         // Track how many messages were removed
-        let removed_from_queue = initial_count - self.messages.len();
+        let removed_from_queue = initial_count - self.pending_count();
         let removed_from_in_flight = initial_in_flight - self.in_flight.len();
         let total_removed = removed_from_queue + removed_from_in_flight;
 
@@ -449,7 +475,7 @@ impl Queue {
         total_removed
     }
 
-    pub fn enqueue(&mut self, content: String, ttl_seconds: Option<u64>, delay_seconds: Option<u64>) -> Result<Uuid, String> {
+    pub fn enqueue(&mut self, content: String, ttl_seconds: Option<u64>, delay_seconds: Option<u64>, priority: Option<u8>) -> Result<Uuid, String> {
         let _timer = OPERATION_DURATION.start_timer();
         let content_hash = Self::compute_content_hash(&content);
 
@@ -474,18 +500,22 @@ impl Queue {
         // Calculate delivery time if delay is specified
         let delivery_after = delay_seconds.map(|delay| Utc::now() + Duration::seconds(delay as i64));
 
+        // Clamp priority to 0-9 range
+        let priority = priority.unwrap_or(0).min(9);
+
         let message = Message {
             id: Uuid::new_v4(),
             content,
             content_hash,
             created_at: Utc::now(),
+            priority,
             receipt_handle: None,
             visible_after: None,
             expires_at,
             delivery_after,
         };
         let id = message.id;
-        self.messages.push_back(message);
+        self.push_message(message);
         MESSAGES_ENQUEUED_TOTAL.inc();
         self.time_series.record_enqueue(self.size());
         Ok(id)
@@ -496,7 +526,7 @@ impl Queue {
         let mut results = Vec::with_capacity(messages.len());
 
         for msg in messages {
-            results.push(self.enqueue(msg.content, msg.ttl_seconds, msg.delay_seconds));
+            results.push(self.enqueue(msg.content, msg.ttl_seconds, msg.delay_seconds, msg.priority));
         }
 
         results
@@ -513,12 +543,7 @@ impl Queue {
             self.clean_expired_dedup_hashes();
         }
 
-        // Atomically handle expired messages and dequeue new ones in a single operation
-        // This ensures no other thread can interfere between checking expired and dequeuing
-
-        // Step 1: Process expired messages atomically
-        // Preallocate with estimated capacity for better performance
-        let mut expired_messages = Vec::with_capacity(self.in_flight.len().min(100));
+        // Step 1: Process expired in-flight messages, re-queue them at their original priority
         let mut expired_handles = Vec::with_capacity(self.in_flight.len().min(100));
 
         for (handle, msg) in self.in_flight.iter() {
@@ -531,55 +556,64 @@ impl Queue {
             if let Some(mut msg) = self.in_flight.remove(&handle) {
                 msg.receipt_handle = None;
                 msg.visible_after = None;
-                expired_messages.push(msg);
+                // Re-queue at the original priority
+                self.push_message(msg);
                 MESSAGES_EXPIRED_TOTAL.inc();
             }
         }
 
-        // Add expired messages back to the queue
-        for msg in expired_messages {
-            self.messages.push_back(msg);
-        }
-
-        // Step 2: Dequeue requested messages atomically, skipping delayed messages
-        // Preallocate with exact capacity for better performance
+        // Step 2: Dequeue from highest priority to lowest, skipping delayed messages
         let mut result = Vec::with_capacity(count);
         let mut messages_to_flight = Vec::with_capacity(count);
-        let mut delayed_messages = Vec::with_capacity(count.min(10));
 
-        // Store initial queue size to know how many messages we can check
-        let initial_queue_size = self.messages.len();
-        let mut checked = 0;
+        // Collect priority levels in descending order (highest first)
+        let priorities: Vec<u8> = self.messages.keys().rev().cloned().collect();
 
-        // We need to check all messages to account for delayed ones
-        while result.len() < count && checked < initial_queue_size {
-            if let Some(mut msg) = self.messages.pop_front() {
-                checked += 1;
-
-                // Check if message is ready for delivery
-                if let Some(delivery_after) = msg.delivery_after {
-                    if delivery_after > now {
-                        // Message is delayed, put it back for later
-                        delayed_messages.push(msg);
-                        continue;
-                    }
-                }
-
-                let receipt_handle = Uuid::new_v4();
-                msg.receipt_handle = Some(receipt_handle);
-                msg.visible_after = Some(now + visibility_timeout);
-                messages_to_flight.push((receipt_handle, msg.clone()));
-                result.push(msg);
-                MESSAGES_DEQUEUED_TOTAL.inc();
-            } else {
+        for priority in priorities {
+            if result.len() >= count {
                 break;
+            }
+
+            let bucket = match self.messages.get_mut(&priority) {
+                Some(b) => b,
+                None => continue,
+            };
+
+            let initial_bucket_size = bucket.len();
+            let mut checked = 0;
+            let mut delayed_messages = Vec::new();
+
+            while result.len() < count && checked < initial_bucket_size {
+                if let Some(mut msg) = bucket.pop_front() {
+                    checked += 1;
+
+                    // Check if message is ready for delivery
+                    if let Some(delivery_after) = msg.delivery_after {
+                        if delivery_after > now {
+                            delayed_messages.push(msg);
+                            continue;
+                        }
+                    }
+
+                    let receipt_handle = Uuid::new_v4();
+                    msg.receipt_handle = Some(receipt_handle);
+                    msg.visible_after = Some(now + visibility_timeout);
+                    messages_to_flight.push((receipt_handle, msg.clone()));
+                    result.push(msg);
+                    MESSAGES_DEQUEUED_TOTAL.inc();
+                } else {
+                    break;
+                }
+            }
+
+            // Put delayed messages back at the front of the bucket
+            for msg in delayed_messages.into_iter().rev() {
+                bucket.push_front(msg);
             }
         }
 
-        // Put delayed messages back at the front of the queue
-        for msg in delayed_messages.into_iter().rev() {
-            self.messages.push_front(msg);
-        }
+        // Remove empty buckets
+        self.messages.retain(|_, bucket| !bucket.is_empty());
 
         // Add all messages to in_flight in one atomic batch
         for (handle, msg) in messages_to_flight {
@@ -638,12 +672,12 @@ impl Queue {
     }
 
     pub fn size(&self) -> usize {
-        self.messages.len() + self.in_flight.len()
+        self.pending_count() + self.in_flight.len()
     }
 
     pub fn total_bytes(&self) -> usize {
         // Calculate total bytes from all messages in queue (pending + in-flight)
-        let pending_bytes: usize = self.messages.iter()
+        let pending_bytes: usize = self.iter_all_pending()
             .map(|msg| msg.content.len())
             .sum();
 
@@ -661,7 +695,7 @@ impl Queue {
             .filter(|msg| msg.visible_after.map(|va| va <= now).unwrap_or(false))
             .count();
 
-        self.messages.len() + expired_count
+        self.pending_count() + expired_count
     }
 
     pub fn get_dedup_cache_size(&self) -> usize {
@@ -671,34 +705,35 @@ impl Queue {
     pub fn peek_messages(&self, count: usize, offset: usize) -> Vec<MessagePreview> {
         let _now = Utc::now();
         let mut result = Vec::new();
-        
-        // Get pending messages
-        let pending_messages: Vec<MessagePreview> = self.messages
-            .iter()
+        let pending_count = self.pending_count();
+
+        // Get pending messages in priority order (highest first)
+        let pending_messages: Vec<MessagePreview> = self.iter_all_pending()
             .skip(offset)
             .take(count)
             .map(|msg| MessagePreview {
                 id: msg.id,
                 content: msg.content.clone(),
                 created_at: msg.created_at,
+                priority: msg.priority,
                 status: MessageStatus::Pending,
                 visible_after: None,
                 expires_at: msg.expires_at,
                 delivery_after: msg.delivery_after,
             })
             .collect();
-        
+
         result.extend(pending_messages);
-        
+
         // If we need more messages, get from in-flight
         if result.len() < count {
             let remaining = count - result.len();
-            let in_flight_offset = if offset > self.messages.len() { 
-                offset - self.messages.len() 
-            } else { 
-                0 
+            let in_flight_offset = if offset > pending_count {
+                offset - pending_count
+            } else {
+                0
             };
-            
+
             let in_flight_messages: Vec<MessagePreview> = self.in_flight
                 .values()
                 .skip(in_flight_offset)
@@ -707,28 +742,30 @@ impl Queue {
                     id: msg.id,
                     content: msg.content.clone(),
                     created_at: msg.created_at,
+                    priority: msg.priority,
                     status: MessageStatus::InFlight,
                     visible_after: msg.visible_after,
                     expires_at: msg.expires_at,
                     delivery_after: msg.delivery_after,
                 })
                 .collect();
-            
+
             result.extend(in_flight_messages);
         }
-        
+
         result
     }
 
     pub fn list_all_messages(&self) -> Vec<MessagePreview> {
         let mut result = Vec::new();
 
-        // Add all pending messages
-        for msg in &self.messages {
+        // Add all pending messages in priority order (highest first)
+        for msg in self.iter_all_pending() {
             result.push(MessagePreview {
                 id: msg.id,
                 content: msg.content.clone(),
                 created_at: msg.created_at,
+                priority: msg.priority,
                 status: MessageStatus::Pending,
                 visible_after: None,
                 expires_at: msg.expires_at,
@@ -742,6 +779,7 @@ impl Queue {
                 id: msg.id,
                 content: msg.content.clone(),
                 created_at: msg.created_at,
+                priority: msg.priority,
                 status: MessageStatus::InFlight,
                 visible_after: msg.visible_after,
                 expires_at: msg.expires_at,
@@ -749,8 +787,8 @@ impl Queue {
             });
         }
 
-        // Sort by creation time
-        result.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        // Sort by priority descending, then by creation time ascending
+        result.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.created_at.cmp(&b.created_at)));
         result
     }
 
@@ -768,7 +806,7 @@ impl Queue {
             deduplication_window_seconds: self.spec.deduplication_window_seconds,
             dedup_cache_size: self.get_dedup_cache_size(),
             default_message_ttl_seconds: self.spec.default_message_ttl_seconds,
-            messages_pending: self.messages.len(),
+            messages_pending: self.pending_count(),
             messages_in_flight: self.in_flight.len(),
             visible_messages: self.get_visible_count(),
             recent_messages: self.peek_messages(5, 0), // Show recent 5 messages
@@ -781,7 +819,7 @@ impl Queue {
         let now = Utc::now();
 
         // Check both pending and in-flight messages
-        let oldest_pending = self.messages.iter().map(|m| m.created_at).min();
+        let oldest_pending = self.iter_all_pending().map(|m| m.created_at).min();
         let oldest_in_flight = self.in_flight.values().map(|m| m.created_at).min();
 
         // Find the older of the two
@@ -801,8 +839,7 @@ impl Queue {
             return None;
         }
 
-        let total_age: i64 = self.messages
-            .iter()
+        let total_age: i64 = self.iter_all_pending()
             .chain(self.in_flight.values())
             .map(|m| (now - m.created_at).num_seconds())
             .sum();
@@ -840,7 +877,7 @@ impl AppState {
                             if let Ok(spec) = serde_json::from_str::<QueueSpec>(&content) {
                                 let queue = Queue {
                                     spec: spec.clone(),
-                                    messages: VecDeque::new(),
+                                    messages: BTreeMap::new(),
                                     in_flight: HashMap::new(),
                                     dedup_hashes: HashMap::new(),
                                     time_series: TimeSeriesTracker::new(24),
@@ -905,9 +942,9 @@ impl AppState {
         let queues = self.queues.read().await;
         let mut total_pending = 0;
         let mut total_in_flight = 0;
-        
+
         for queue in queues.values() {
-            total_pending += queue.messages.len();
+            total_pending += queue.pending_count();
             total_in_flight += queue.in_flight.len();
         }
         
@@ -971,6 +1008,8 @@ pub struct EnqueueRequest {
     pub ttl_seconds: Option<u64>, // Optional TTL in seconds - message will be deleted after this time
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delay_seconds: Option<u64>, // Optional delay in seconds - message won't be delivered before this time
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u8>, // Optional priority 0-9 (higher = higher priority, default 0)
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -980,6 +1019,8 @@ pub struct BatchMessageRequest {
     pub ttl_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delay_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u8>, // Optional priority 0-9 (higher = higher priority, default 0)
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -1038,6 +1079,7 @@ pub struct MessagePreview {
     pub id: uuid::Uuid,
     pub content: String,
     pub created_at: DateTime<Utc>,
+    pub priority: u8,
     pub status: MessageStatus,
     pub visible_after: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1321,7 +1363,7 @@ pub async fn enqueue_message(
     let mut queues = state.queues.write().await;
 
     if let Some(queue) = queues.get_mut(&queue_name) {
-        match queue.enqueue(req.content, req.ttl_seconds, req.delay_seconds) {
+        match queue.enqueue(req.content, req.ttl_seconds, req.delay_seconds, req.priority) {
             Ok(id) => Ok(Json(EnqueueResponse { id, error: None })),
             Err(e) => {
                 warn!("Failed to enqueue message: {}", e);
@@ -1823,25 +1865,25 @@ mod tests {
         );
 
         // Test message without TTL (should not expire)
-        let id1 = queue.enqueue("Message without TTL".to_string(), None, None).unwrap();
+        let id1 = queue.enqueue("Message without TTL".to_string(), None, None, None).unwrap();
 
         // Test message with TTL of 5 seconds
-        let id2 = queue.enqueue("Message with 5s TTL".to_string(), Some(5), None).unwrap();
+        let id2 = queue.enqueue("Message with 5s TTL".to_string(), Some(5), None, None).unwrap();
 
         // Test message with TTL of 1 hour
-        let id3 = queue.enqueue("Message with 1hr TTL".to_string(), Some(3600), None).unwrap();
+        let id3 = queue.enqueue("Message with 1hr TTL".to_string(), Some(3600), None, None).unwrap();
 
         // Check all messages are present initially
-        assert_eq!(queue.messages.len(), 3);
+        assert_eq!(queue.pending_count(), 3);
 
         // Verify TTL is set correctly
-        let msg_no_ttl = queue.messages.iter().find(|m| m.id == id1).unwrap();
+        let msg_no_ttl = queue.iter_all_pending().find(|m| m.id == id1).unwrap();
         assert!(msg_no_ttl.expires_at.is_none());
 
-        let msg_5s_ttl = queue.messages.iter().find(|m| m.id == id2).unwrap();
+        let msg_5s_ttl = queue.iter_all_pending().find(|m| m.id == id2).unwrap();
         assert!(msg_5s_ttl.expires_at.is_some());
 
-        let msg_1hr_ttl = queue.messages.iter().find(|m| m.id == id3).unwrap();
+        let msg_1hr_ttl = queue.iter_all_pending().find(|m| m.id == id3).unwrap();
         assert!(msg_1hr_ttl.expires_at.is_some());
     }
 
@@ -1856,15 +1898,15 @@ mod tests {
         );
 
         // Add a message with a very short TTL (1 second)
-        let _expired_id = queue.enqueue("Should expire".to_string(), Some(1), None).unwrap();
+        let _expired_id = queue.enqueue("Should expire".to_string(), Some(1), None, None).unwrap();
 
         // Add a message without TTL
-        let _persistent_id = queue.enqueue("Should persist".to_string(), None, None).unwrap();
+        let _persistent_id = queue.enqueue("Should persist".to_string(), None, None, None).unwrap();
 
         // Add a message with longer TTL
-        let _long_ttl_id = queue.enqueue("Should also persist".to_string(), Some(60), None).unwrap();
+        let _long_ttl_id = queue.enqueue("Should also persist".to_string(), Some(60), None, None).unwrap();
 
-        assert_eq!(queue.messages.len(), 3);
+        assert_eq!(queue.pending_count(), 3);
 
         // Sleep for 2 seconds to let the first message expire
         sleep(StdDuration::from_secs(2)).await;
@@ -1873,11 +1915,10 @@ mod tests {
         queue.clean_expired_messages();
 
         // Should have 2 messages left (the expired one should be removed)
-        assert_eq!(queue.messages.len(), 2);
+        assert_eq!(queue.pending_count(), 2);
 
         // Verify the correct messages remain
-        let remaining_contents: Vec<String> = queue.messages
-            .iter()
+        let remaining_contents: Vec<String> = queue.iter_all_pending()
             .map(|m| m.content.clone())
             .collect();
 
@@ -1901,16 +1942,19 @@ mod tests {
                 content: "Message 1".to_string(),
                 ttl_seconds: Some(10),
                 delay_seconds: None,
+                priority: None,
             },
             BatchMessageRequest {
                 content: "Message 2".to_string(),
                 ttl_seconds: None,
                 delay_seconds: None,
+                priority: None,
             },
             BatchMessageRequest {
                 content: "Message 3".to_string(),
                 ttl_seconds: Some(3600),
                 delay_seconds: None,
+                priority: None,
             },
         ];
 
@@ -1923,15 +1967,15 @@ mod tests {
         }
 
         // Verify TTL settings
-        assert_eq!(queue.messages.len(), 3);
+        assert_eq!(queue.pending_count(), 3);
 
-        let msg1 = queue.messages.iter().find(|m| m.content == "Message 1").unwrap();
+        let msg1 = queue.iter_all_pending().find(|m| m.content == "Message 1").unwrap();
         assert!(msg1.expires_at.is_some());
 
-        let msg2 = queue.messages.iter().find(|m| m.content == "Message 2").unwrap();
+        let msg2 = queue.iter_all_pending().find(|m| m.content == "Message 2").unwrap();
         assert!(msg2.expires_at.is_none());
 
-        let msg3 = queue.messages.iter().find(|m| m.content == "Message 3").unwrap();
+        let msg3 = queue.iter_all_pending().find(|m| m.content == "Message 3").unwrap();
         assert!(msg3.expires_at.is_some());
     }
 
@@ -1951,6 +1995,7 @@ mod tests {
             content: "Already expired".to_string(),
             content_hash: Queue::compute_content_hash("Already expired"),
             created_at: Utc::now() - Duration::seconds(100),
+            priority: 0,
             receipt_handle: None,
             visible_after: None,
             expires_at: Some(Utc::now() - Duration::seconds(10)), // Expired 10 seconds ago
@@ -1963,21 +2008,22 @@ mod tests {
             content: "Valid message".to_string(),
             content_hash: Queue::compute_content_hash("Valid message"),
             created_at: Utc::now(),
+            priority: 0,
             receipt_handle: None,
             visible_after: None,
             expires_at: Some(Utc::now() + Duration::seconds(100)), // Expires in 100 seconds
             delivery_after: None,
         };
 
-        queue.messages.push_back(expired_msg.clone());
-        queue.messages.push_back(valid_msg.clone());
+        queue.push_message(expired_msg.clone());
+        queue.push_message(valid_msg.clone());
 
         // Also test in-flight expired message
         let receipt = Uuid::new_v4();
         expired_msg.receipt_handle = Some(receipt);
         queue.in_flight.insert(receipt, expired_msg);
 
-        assert_eq!(queue.messages.len(), 2);
+        assert_eq!(queue.pending_count(), 2);
         assert_eq!(queue.in_flight.len(), 1);
 
         // Dequeue should clean expired messages
@@ -2001,8 +2047,8 @@ mod tests {
             None,
         );
 
-        let _id1 = queue.enqueue("Message with TTL".to_string(), Some(60), None).unwrap();
-        let _id2 = queue.enqueue("Message without TTL".to_string(), None, None).unwrap();
+        let _id1 = queue.enqueue("Message with TTL".to_string(), Some(60), None, None).unwrap();
+        let _id2 = queue.enqueue("Message without TTL".to_string(), None, None, None).unwrap();
 
         let previews = queue.peek_messages(10, 0);
         assert_eq!(previews.len(), 2);
@@ -2032,12 +2078,12 @@ mod tests {
         );
 
         // Add immediate message
-        let _immediate_id = queue.enqueue("Immediate message".to_string(), None, None).unwrap();
+        let _immediate_id = queue.enqueue("Immediate message".to_string(), None, None, None).unwrap();
 
         // Add delayed message (10 seconds)
-        let _delayed_id = queue.enqueue("Delayed message".to_string(), None, Some(10)).unwrap();
+        let _delayed_id = queue.enqueue("Delayed message".to_string(), None, Some(10), None).unwrap();
 
-        assert_eq!(queue.messages.len(), 2);
+        assert_eq!(queue.pending_count(), 2);
 
         // Try to dequeue - should only get immediate message
         let messages = queue.dequeue(10);
@@ -2045,10 +2091,10 @@ mod tests {
         assert_eq!(messages[0].content, "Immediate message");
 
         // Delayed message should still be in queue
-        assert_eq!(queue.messages.len(), 1);
+        assert_eq!(queue.pending_count(), 1);
 
         // Verify delayed message has delivery_after set
-        let delayed_msg = queue.messages.front().unwrap();
+        let delayed_msg = queue.iter_all_pending().next().unwrap();
         assert_eq!(delayed_msg.content, "Delayed message");
         assert!(delayed_msg.delivery_after.is_some());
     }
@@ -2064,9 +2110,9 @@ mod tests {
         );
 
         // Enqueue some messages
-        let _id1 = queue.enqueue("Message 1".to_string(), None, None).unwrap();
-        let _id2 = queue.enqueue("Message 2".to_string(), None, None).unwrap();
-        let _id3 = queue.enqueue("Message 3".to_string(), None, None).unwrap();
+        let _id1 = queue.enqueue("Message 1".to_string(), None, None, None).unwrap();
+        let _id2 = queue.enqueue("Message 2".to_string(), None, None, None).unwrap();
+        let _id3 = queue.enqueue("Message 3".to_string(), None, None, None).unwrap();
 
         // Dequeue all messages
         let messages = queue.dequeue(3);
@@ -2103,9 +2149,9 @@ mod tests {
         assert!(detail_info.average_message_age_seconds.is_none());
 
         // Add some messages
-        queue.enqueue("Message 1".to_string(), None, None).unwrap();
-        queue.enqueue("Message 2".to_string(), None, None).unwrap();
-        queue.enqueue("Message 3".to_string(), None, None).unwrap();
+        queue.enqueue("Message 1".to_string(), None, None, None).unwrap();
+        queue.enqueue("Message 2".to_string(), None, None, None).unwrap();
+        queue.enqueue("Message 3".to_string(), None, None, None).unwrap();
 
         // Get statistics
         let detail_info = queue.get_detailed_info("test_queue");
@@ -2123,5 +2169,216 @@ mod tests {
         assert_eq!(detail_info.messages_pending, 3);
         assert_eq!(detail_info.messages_in_flight, 0);
         assert_eq!(detail_info.size, 3);
+    }
+
+    // Priority-specific tests
+
+    #[test]
+    fn test_priority_dequeue_order() {
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+
+        // Enqueue messages at different priorities
+        queue.enqueue("low priority".to_string(), None, None, Some(0)).unwrap();
+        queue.enqueue("medium priority".to_string(), None, None, Some(5)).unwrap();
+        queue.enqueue("high priority".to_string(), None, None, Some(9)).unwrap();
+
+        // Dequeue should return highest priority first
+        let messages = queue.dequeue(3);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].content, "high priority");
+        assert_eq!(messages[0].priority, 9);
+        assert_eq!(messages[1].content, "medium priority");
+        assert_eq!(messages[1].priority, 5);
+        assert_eq!(messages[2].content, "low priority");
+        assert_eq!(messages[2].priority, 0);
+    }
+
+    #[test]
+    fn test_fifo_within_same_priority() {
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+
+        queue.enqueue("first".to_string(), None, None, Some(5)).unwrap();
+        queue.enqueue("second".to_string(), None, None, Some(5)).unwrap();
+        queue.enqueue("third".to_string(), None, None, Some(5)).unwrap();
+
+        let messages = queue.dequeue(3);
+        assert_eq!(messages[0].content, "first");
+        assert_eq!(messages[1].content, "second");
+        assert_eq!(messages[2].content, "third");
+    }
+
+    #[test]
+    fn test_default_priority_is_zero() {
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+
+        queue.enqueue("no priority specified".to_string(), None, None, None).unwrap();
+
+        let messages = queue.dequeue(1);
+        assert_eq!(messages[0].priority, 0);
+    }
+
+    #[test]
+    fn test_priority_clamping() {
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+
+        // Priority > 9 should be clamped to 9
+        queue.enqueue("over max".to_string(), None, None, Some(255)).unwrap();
+
+        let messages = queue.dequeue(1);
+        assert_eq!(messages[0].priority, 9);
+    }
+
+    #[tokio::test]
+    async fn test_delayed_plus_priority() {
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+
+        // High priority but delayed
+        queue.enqueue("high delayed".to_string(), None, Some(10), Some(9)).unwrap();
+        // Low priority but immediate
+        queue.enqueue("low immediate".to_string(), None, None, Some(0)).unwrap();
+
+        // Should get the low-priority immediate message since high-priority is delayed
+        let messages = queue.dequeue(10);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "low immediate");
+
+        // Delayed message should still be in queue
+        assert_eq!(queue.pending_count(), 1);
+    }
+
+    #[test]
+    fn test_requeue_preserves_priority() {
+        let mut queue = Queue::new("test_queue".to_string(), 1, false, 300, None); // 1s timeout
+
+        queue.enqueue("high priority msg".to_string(), None, None, Some(7)).unwrap();
+
+        let messages = queue.dequeue(1);
+        assert_eq!(messages[0].priority, 7);
+
+        // Simulate visibility timeout by manually re-queuing
+        let mut msg = messages[0].clone();
+        msg.receipt_handle = None;
+        msg.visible_after = None;
+        queue.push_message(msg);
+
+        // Dequeue again - priority should be preserved
+        let messages2 = queue.dequeue(1);
+        assert_eq!(messages2[0].priority, 7);
+        assert_eq!(messages2[0].content, "high priority msg");
+    }
+
+    #[test]
+    fn test_clean_expired_across_priorities() {
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+
+        // Add expired message at priority 5
+        let expired_msg = Message {
+            id: Uuid::new_v4(),
+            content: "expired p5".to_string(),
+            content_hash: Queue::compute_content_hash("expired p5"),
+            created_at: Utc::now() - Duration::seconds(100),
+            priority: 5,
+            receipt_handle: None,
+            visible_after: None,
+            expires_at: Some(Utc::now() - Duration::seconds(10)),
+            delivery_after: None,
+        };
+        queue.push_message(expired_msg);
+
+        // Add valid message at priority 3
+        queue.enqueue("valid p3".to_string(), None, None, Some(3)).unwrap();
+
+        assert_eq!(queue.pending_count(), 2);
+
+        let removed = queue.clean_expired_messages();
+        assert_eq!(removed, 1);
+        assert_eq!(queue.pending_count(), 1);
+
+        let remaining = queue.iter_all_pending().next().unwrap();
+        assert_eq!(remaining.content, "valid p3");
+    }
+
+    #[test]
+    fn test_peek_priority_order() {
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+
+        queue.enqueue("low".to_string(), None, None, Some(1)).unwrap();
+        queue.enqueue("high".to_string(), None, None, Some(9)).unwrap();
+        queue.enqueue("medium".to_string(), None, None, Some(5)).unwrap();
+
+        let previews = queue.peek_messages(10, 0);
+        assert_eq!(previews.len(), 3);
+        assert_eq!(previews[0].content, "high");
+        assert_eq!(previews[0].priority, 9);
+        assert_eq!(previews[1].content, "medium");
+        assert_eq!(previews[1].priority, 5);
+        assert_eq!(previews[2].content, "low");
+        assert_eq!(previews[2].priority, 1);
+    }
+
+    #[test]
+    fn test_batch_with_priorities() {
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+
+        let batch = vec![
+            BatchMessageRequest {
+                content: "low".to_string(),
+                ttl_seconds: None,
+                delay_seconds: None,
+                priority: Some(0),
+            },
+            BatchMessageRequest {
+                content: "high".to_string(),
+                ttl_seconds: None,
+                delay_seconds: None,
+                priority: Some(9),
+            },
+            BatchMessageRequest {
+                content: "medium".to_string(),
+                ttl_seconds: None,
+                delay_seconds: None,
+                priority: Some(5),
+            },
+        ];
+
+        let results = queue.enqueue_batch(batch);
+        assert!(results.iter().all(|r| r.is_ok()));
+
+        let messages = queue.dequeue(3);
+        assert_eq!(messages[0].content, "high");
+        assert_eq!(messages[1].content, "medium");
+        assert_eq!(messages[2].content, "low");
+    }
+
+    #[test]
+    fn test_purge_clears_all_buckets() {
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+
+        queue.enqueue("p0".to_string(), None, None, Some(0)).unwrap();
+        queue.enqueue("p5".to_string(), None, None, Some(5)).unwrap();
+        queue.enqueue("p9".to_string(), None, None, Some(9)).unwrap();
+
+        assert_eq!(queue.pending_count(), 3);
+
+        queue.purge();
+        assert_eq!(queue.pending_count(), 0);
+        assert_eq!(queue.size(), 0);
+    }
+
+    #[test]
+    fn test_size_counts_all_buckets() {
+        let mut queue = Queue::new("test_queue".to_string(), 30, false, 300, None);
+
+        queue.enqueue("p0".to_string(), None, None, Some(0)).unwrap();
+        queue.enqueue("p3".to_string(), None, None, Some(3)).unwrap();
+        queue.enqueue("p7".to_string(), None, None, Some(7)).unwrap();
+
+        assert_eq!(queue.pending_count(), 3);
+        assert_eq!(queue.size(), 3);
+
+        // Dequeue one and verify size
+        queue.dequeue(1);
+        assert_eq!(queue.pending_count(), 2);
+        assert_eq!(queue.size(), 3); // 2 pending + 1 in-flight
     }
 }

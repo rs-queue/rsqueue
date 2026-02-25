@@ -10,6 +10,7 @@ A high-performance, thread-safe message queue service written in Rust with HTTP 
 - 🔁 **Message Deduplication**: Optional content-based deduplication using SHA-256 hashing
 - ⏳ **Message TTL (Time To Live)**: Optional message expiration - messages automatically deleted after specified time
 - ⏰ **Delayed/Scheduled Messages**: Schedule messages for future delivery with delay_seconds parameter
+- 🔢 **Message Priorities**: Priority levels 0-9 (higher = higher priority), dequeued highest-first with FIFO within same level
 - 📝 **Persistent Queue Specs**: Queue configurations survive server restarts
 - 🔄 **Automatic Re-queueing**: Unprocessed messages automatically return to the queue
 - 📦 **Batch Operations**: Enqueue and delete multiple messages in a single request
@@ -104,9 +105,18 @@ curl -X POST http://localhost:4000/queues/task-queue/messages \
     "delay_seconds": 60
   }'
 
+# High-priority message (priority 0-9, higher = dequeued first)
+curl -X POST http://localhost:4000/queues/task-queue/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "content": "Urgent task",
+    "priority": 9
+  }'
+
 # Or use the CLI tool
 rsqueue-cli send task-queue "Process order #12345"
 rsqueue-cli send task-queue "Delayed task" --delay 60 --ttl 300
+rsqueue-cli send task-queue "Urgent task" --priority 9
 ```
 
 ### 3. Receive Messages
@@ -180,7 +190,9 @@ rsqueue-cli delete-message task-queue 650e8400-e29b-41d4-a716-446655440001
   ```json
   {
     "content": "string",
-    "ttl_seconds": 300  // optional, message expires after this many seconds
+    "ttl_seconds": 300,       // optional, message expires after this many seconds
+    "delay_seconds": 60,      // optional, message delivered after this many seconds
+    "priority": 5             // optional, 0-9 (higher = higher priority, default 0)
   }
   ```
 - **Returns**: `{"id": "uuid"}`
@@ -191,9 +203,9 @@ rsqueue-cli delete-message task-queue 650e8400-e29b-41d4-a716-446655440001
   ```json
   {
     "messages": [
-      {"content": "message1", "ttl_seconds": 60},
-      {"content": "message2", "ttl_seconds": null},
-      {"content": "message3", "ttl_seconds": 300}
+      {"content": "message1", "ttl_seconds": 60, "priority": 9},
+      {"content": "message2"},
+      {"content": "message3", "priority": 5}
     ]
   }
   ```
@@ -426,7 +438,7 @@ MIT License - feel free to use this in your projects!
 - [x] CLI tool for queue operations
 - [x] Batch delete operations
 - [x] Queue statistics and performance tracking
-- [ ] Implement message priorities
+- [x] Implement message priorities
 - [ ] Add dead letter queue support
 - [ ] Create distributed version with clustering
 - [ ] Add message compression

@@ -73,6 +73,10 @@ enum Commands {
         /// Message delay in seconds (optional)
         #[arg(short, long)]
         delay: Option<u64>,
+
+        /// Message priority 0-9 (higher = higher priority, default 0)
+        #[arg(short = 'P', long)]
+        priority: Option<u8>,
     },
 
     /// Receive messages from a queue
@@ -170,6 +174,7 @@ fn main() {
             content,
             ttl,
             delay,
+            priority,
         } => send_message(
             &client,
             &cli.url,
@@ -179,6 +184,7 @@ fn main() {
             &content,
             ttl,
             delay,
+            priority,
         ),
 
         Commands::Receive { queue, count } => receive_messages(
@@ -367,6 +373,7 @@ fn send_message(
     content: &str,
     ttl: Option<u64>,
     delay: Option<u64>,
+    priority: Option<u8>,
 ) -> Result<(), String> {
     let url = format!("{}/queues/{}/messages", base_url, queue);
     let mut body = json!({
@@ -379,6 +386,10 @@ fn send_message(
 
     if let Some(d) = delay {
         body["delay_seconds"] = json!(d);
+    }
+
+    if let Some(p) = priority {
+        body["priority"] = json!(p);
     }
 
     let response = build_request(client, reqwest::Method::POST, &url, user, password)

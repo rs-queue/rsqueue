@@ -253,7 +253,7 @@ async fn get_queue_metrics(
         let detail_info = queue.get_detailed_info(&queue_name);
         Ok(Json(QueueMetrics {
             name: queue_name,
-            messages_pending: queue.messages.len(),
+            messages_pending: queue.pending_count(),
             messages_in_flight: queue.in_flight.len(),
             total_size: queue.size(),
             total_bytes: queue.total_bytes(),
@@ -449,6 +449,7 @@ async fn enqueue_message_with_events(
     Path(queue_name): Path<String>,
     Json(req): Json<EnqueueRequest>,
 ) -> Result<Json<EnqueueResponse>, StatusCode> {
+    let priority = req.priority.unwrap_or(0).min(9);
     let result = enqueue_message(State(state.clone()), Path(queue_name.clone()), Json(req)).await;
 
     if let Ok(Json(ref response)) = result {
@@ -460,6 +461,7 @@ async fn enqueue_message_with_events(
             state.event_broadcaster.broadcast(QueueEvent::MessageEnqueued {
                 queue_name,
                 message_id: response.id,
+                priority,
                 queue_depth,
                 timestamp: Utc::now(),
             });
@@ -474,6 +476,8 @@ async fn enqueue_batch_with_events(
     Path(queue_name): Path<String>,
     Json(req): Json<BatchEnqueueRequest>,
 ) -> Result<Json<BatchEnqueueResponse>, StatusCode> {
+    // Capture priorities before req is consumed
+    let priorities: Vec<u8> = req.messages.iter().map(|m| m.priority.unwrap_or(0).min(9)).collect();
     let result = enqueue_batch(State(state.clone()), Path(queue_name.clone()), Json(req)).await;
 
     if let Ok(Json(ref response)) = result {
@@ -482,11 +486,12 @@ async fn enqueue_batch_with_events(
         drop(queues);
 
         // Broadcast individual events for each successful enqueue
-        for enqueue_result in &response.results {
+        for (i, enqueue_result) in response.results.iter().enumerate() {
             if enqueue_result.error.is_none() {
                 state.event_broadcaster.broadcast(QueueEvent::MessageEnqueued {
                     queue_name: queue_name.clone(),
                     message_id: enqueue_result.id,
+                    priority: priorities.get(i).copied().unwrap_or(0),
                     queue_depth,
                     timestamp: Utc::now(),
                 });
