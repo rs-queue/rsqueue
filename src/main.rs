@@ -41,6 +41,7 @@ struct MetricsSummary {
     duplicate_messages_rejected_total: u64,
     messages_expired_total: u64,
     messages_moved_to_dlq_total: u64,
+    messages_evicted_total: u64,
     queues_created_total: u64,
     queues_deleted_total: u64,
     queues_purged_total: u64,
@@ -62,6 +63,10 @@ struct QueueMetrics {
     created_at: DateTime<Utc>,
     visibility_timeout_seconds: u64,
     enable_deduplication: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_queue_size: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remaining_capacity: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     oldest_message_age_seconds: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -225,6 +230,7 @@ async fn get_metrics_summary() -> Json<MetricsSummary> {
         duplicate_messages_rejected_total: get_duplicate_messages_rejected_total(),
         messages_expired_total: get_messages_expired_total(),
         messages_moved_to_dlq_total: get_messages_moved_to_dlq_total(),
+        messages_evicted_total: get_messages_evicted_total(),
         queues_created_total: get_queues_created_total(),
         queues_deleted_total: get_queues_deleted_total(),
         queues_purged_total: get_queues_purged_total(),
@@ -265,6 +271,8 @@ async fn get_queue_metrics(
             created_at: queue.spec.created_at,
             visibility_timeout_seconds: queue.spec.visibility_timeout_seconds,
             enable_deduplication: queue.spec.enable_deduplication,
+            max_queue_size: queue.spec.max_queue_size,
+            remaining_capacity: queue.remaining_capacity(),
             oldest_message_age_seconds: detail_info.oldest_message_age_seconds,
             average_message_age_seconds: detail_info.average_message_age_seconds,
         }))
@@ -460,6 +468,7 @@ async fn sse_queue_events(
                     QueueEvent::MessageDeleted { queue_name: qn, .. } => *qn == queue_name,
                     QueueEvent::BatchDeleted { queue_name: qn, .. } => *qn == queue_name,
                     QueueEvent::QueuePurged { queue_name: qn, .. } => *qn == queue_name,
+                    QueueEvent::MessagesEvicted { queue_name: qn, .. } => *qn == queue_name,
                     QueueEvent::QueueDeleted { queue_name: qn, .. } => *qn == queue_name,
                     QueueEvent::MessageMovedToDLQ { source_queue, dlq_queue, .. } => {
                         *source_queue == queue_name || *dlq_queue == queue_name

@@ -59,10 +59,23 @@ enum Commands {
         /// Max receive count before moving to DLQ
         #[arg(long)]
         max_receive_count: Option<u32>,
+
+        /// Max messages (pending + in-flight) to hold before dropping the oldest
+        #[arg(long)]
+        max_size: Option<usize>,
     },
 
     /// List all queues
     List,
+
+    /// Set (or clear) the size cap on an existing queue
+    SetLimit {
+        /// Name of the queue
+        name: String,
+
+        /// Max messages to hold; 0 removes the cap
+        max_size: usize,
+    },
 
     /// Delete a queue
     Delete {
@@ -177,6 +190,7 @@ fn main() {
             compress,
             dlq,
             max_receive_count,
+            max_size,
         } => create_queue(
             &client,
             &cli.url,
@@ -190,6 +204,7 @@ fn main() {
             compress,
             dlq.as_deref(),
             max_receive_count,
+            max_size,
         ),
 
         Commands::List => list_queues(
@@ -198,6 +213,16 @@ fn main() {
             cli.user.as_deref(),
             cli.password.as_deref(),
             cli.api_key.as_deref(),
+        ),
+
+        Commands::SetLimit { name, max_size } => set_queue_limit(
+            &client,
+            &cli.url,
+            cli.user.as_deref(),
+            cli.password.as_deref(),
+            cli.api_key.as_deref(),
+            &name,
+            max_size,
         ),
 
         Commands::Delete { name } => delete_queue(
@@ -342,6 +367,7 @@ fn create_queue(
     compress: bool,
     dlq: Option<&str>,
     max_receive_count: Option<u32>,
+    max_size: Option<usize>,
 ) -> Result<(), String> {
     let url = format!("{}/queues", base_url);
     let mut body = json!({
@@ -357,6 +383,9 @@ fn create_queue(
     }
     if let Some(count) = max_receive_count {
         body["max_receive_count"] = json!(count);
+    }
+    if let Some(size) = max_size {
+        body["max_queue_size"] = json!(size);
     }
 
     let response = build_request(client, reqwest::Method::POST, &url, user, password, api_key)
@@ -400,6 +429,45 @@ fn list_queues(
         Ok(())
     } else {
         Err(format!("Failed to list queues: HTTP {}", response.status()))
+    }
+}
+
+fn set_queue_limit(
+    client: &Client,
+    base_url: &str,
+    user: Option<&str>,
+    password: Option<&str>,
+    api_key: Option<&str>,
+    name: &str,
+    max_size: usize,
+) -> Result<(), String> {
+    let url = format!("{}/queues/{}/settings", base_url, name);
+    let body = json!({ "max_queue_size": max_size });
+
+    let response = build_request(client, reqwest::Method::PUT, &url, user, password, api_key)
+        .json(&body)
+        .send()
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if response.status().is_success() {
+        let spec: serde_json::Value = response
+            .json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+        if max_size == 0 {
+            println!("Size cap removed from queue '{}'", name);
+        } else {
+            println!(
+                "Queue '{}' capped at {} messages (oldest are dropped when full)",
+                name, max_size
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&spec).unwrap());
+        Ok(())
+    } else {
+        Err(format!(
+            "Failed to set queue limit: HTTP {}",
+            response.status()
+        ))
     }
 }
 

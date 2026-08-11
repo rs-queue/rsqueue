@@ -114,6 +114,7 @@ impl WsSession {
             QueueEvent::QueuePurged { queue_name, .. } => Some(queue_name.as_str()),
             QueueEvent::QueueDeleted { queue_name, .. } => Some(queue_name.as_str()),
             QueueEvent::QueueCreated { queue_name, .. } => Some(queue_name.as_str()),
+            QueueEvent::MessagesEvicted { queue_name, .. } => Some(queue_name.as_str()),
             QueueEvent::MessageMovedToDLQ {
                 source_queue,
                 dlq_queue,
@@ -342,6 +343,19 @@ async fn handle_client_message(
                                         timestamp: Utc::now(),
                                     },
                                 );
+                            }
+                            // Moving into the DLQ may push it past its own size cap
+                            let evicted = dlq.take_evicted_count();
+                            if evicted > 0 {
+                                let queue_depth = dlq.size();
+                                let max_queue_size = dlq.spec.max_queue_size.unwrap_or(0);
+                                state.event_broadcaster.broadcast(QueueEvent::MessagesEvicted {
+                                    queue_name: dlq_name.clone(),
+                                    count: evicted,
+                                    queue_depth,
+                                    max_queue_size,
+                                    timestamp: Utc::now(),
+                                });
                             }
                         }
                     }

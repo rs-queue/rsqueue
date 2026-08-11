@@ -68,6 +68,14 @@ pub enum QueueEvent {
         queue_depth: usize,
         timestamp: DateTime<Utc>,
     },
+    #[serde(rename = "messages_evicted")]
+    MessagesEvicted {
+        queue_name: String,
+        count: usize,
+        queue_depth: usize,
+        max_queue_size: usize,
+        timestamp: DateTime<Utc>,
+    },
     #[serde(rename = "message_moved_to_dlq")]
     MessageMovedToDLQ {
         source_queue: String,
@@ -147,6 +155,11 @@ lazy_static::lazy_static! {
     static ref MESSAGES_MOVED_TO_DLQ_TOTAL: IntCounter = IntCounter::new(
         "rsqueue_messages_moved_to_dlq_total",
         "Total number of messages moved to dead letter queue"
+    ).unwrap();
+
+    static ref MESSAGES_EVICTED_TOTAL: IntCounter = IntCounter::new(
+        "rsqueue_messages_evicted_total",
+        "Total number of messages dropped because a queue reached max_queue_size"
     ).unwrap();
 
     // Queue management metrics
@@ -273,6 +286,8 @@ pub struct QueueSpec {
     pub dead_letter_queue: Option<String>, // Target DLQ name
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_receive_count: Option<u32>, // Move to DLQ after this many receives
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_queue_size: Option<usize>, // Cap on pending + in-flight messages (None = unbounded)
 }
 
 // Time-series tracking for graphs
@@ -421,6 +436,7 @@ pub struct Queue {
     pub in_flight: HashMap<Uuid, Message>, // receipt_handle -> Message
     pub dedup_hashes: HashMap<String, DateTime<Utc>>, // content_hash -> expiry time
     pub time_series: TimeSeriesTracker, // Track message events over time
+    pub evicted_count: usize, // Messages dropped by the size cap since the last drain
 }
 
 // Additional atomic helper methods for Queue
@@ -437,12 +453,72 @@ impl Queue {
                 enable_compression: false,
                 dead_letter_queue,
                 max_receive_count,
+                max_queue_size: None,
             },
             messages: BTreeMap::new(),
             in_flight: HashMap::new(),
             dedup_hashes: HashMap::new(),
             time_series: TimeSeriesTracker::new(24), // Keep 24 hours of history by default
+            evicted_count: 0,
         }
+    }
+
+    /// Set the maximum queue size (pending + in-flight). `None` or `Some(0)` means unbounded.
+    pub fn with_max_queue_size(mut self, max_queue_size: Option<usize>) -> Self {
+        self.spec.max_queue_size = normalize_max_queue_size(max_queue_size);
+        self
+    }
+
+    /// Number of messages dropped by the size cap since this was last called.
+    pub fn take_evicted_count(&mut self) -> usize {
+        std::mem::take(&mut self.evicted_count)
+    }
+
+    /// Free capacity before the cap is hit, or `None` when the queue is unbounded.
+    pub fn remaining_capacity(&self) -> Option<usize> {
+        self.spec.max_queue_size.map(|max| max.saturating_sub(self.size()))
+    }
+
+    /// Drop messages until the queue fits within `max_queue_size`.
+    ///
+    /// Eviction is drop-oldest: the oldest message in the lowest-priority bucket goes first, so
+    /// high-priority work survives an overflow. In-flight messages are owned by a consumer and are
+    /// never evicted, so a queue whose cap is fully consumed by in-flight messages stays over
+    /// budget until those are acked or time out — `enqueue` rejects new messages in that case.
+    /// Returns the number of messages dropped.
+    pub fn enforce_capacity(&mut self) -> usize {
+        let max = match self.spec.max_queue_size {
+            Some(max) => max,
+            None => return 0,
+        };
+
+        let mut evicted = 0;
+        while self.size() > max {
+            // BTreeMap keys iterate ascending, so the first key is the lowest priority bucket
+            let priority = match self.messages.keys().next().copied() {
+                Some(priority) => priority,
+                None => break, // Only in-flight messages left - nothing we can evict
+            };
+
+            if let Some(bucket) = self.messages.get_mut(&priority) {
+                if let Some(msg) = bucket.pop_front() {
+                    evicted += 1;
+                    MESSAGES_EVICTED_TOTAL.inc();
+                    warn!(
+                        "Queue '{}' at capacity ({}), dropped message {} (priority {})",
+                        self.spec.name, max, msg.id, msg.priority
+                    );
+                }
+                if bucket.is_empty() {
+                    self.messages.remove(&priority);
+                }
+            } else {
+                break;
+            }
+        }
+
+        self.evicted_count += evicted;
+        evicted
     }
 
     /// Count of all pending messages across all priority buckets
@@ -455,10 +531,11 @@ impl Queue {
         self.messages.iter().rev().flat_map(|(_, bucket)| bucket.iter())
     }
 
-    /// Push a message into the correct priority bucket
+    /// Push a message into the correct priority bucket, evicting overflow if the queue is capped
     pub fn push_message(&mut self, msg: Message) {
         let priority = msg.priority;
         self.messages.entry(priority).or_default().push_back(msg);
+        self.enforce_capacity();
     }
 
     /// Push a message to the front of its priority bucket (for re-queuing delayed messages)
@@ -542,6 +619,21 @@ impl Queue {
 
     pub fn enqueue(&mut self, content: String, ttl_seconds: Option<u64>, delay_seconds: Option<u64>, priority: Option<u8>) -> Result<Uuid, String> {
         let _timer = OPERATION_DURATION.start_timer();
+
+        // A capped queue normally makes room by dropping its oldest message, but in-flight
+        // messages belong to a consumer and cannot be dropped. If they alone fill the cap there is
+        // nothing to evict, so reject the write instead of letting the queue grow past its limit.
+        if let Some(max) = self.spec.max_queue_size {
+            if self.in_flight.len() >= max {
+                return Err(format!(
+                    "Queue '{}' is full: {} message(s) in flight at max_queue_size {}",
+                    self.spec.name,
+                    self.in_flight.len(),
+                    max
+                ));
+            }
+        }
+
         let content_hash = Self::compute_content_hash(&content);
 
         // Check for deduplication if enabled
@@ -922,6 +1014,8 @@ impl Queue {
             default_message_ttl_seconds: self.spec.default_message_ttl_seconds,
             dead_letter_queue: self.spec.dead_letter_queue.clone(),
             max_receive_count: self.spec.max_receive_count,
+            max_queue_size: self.spec.max_queue_size,
+            remaining_capacity: self.remaining_capacity(),
             messages_pending: self.pending_count(),
             messages_in_flight: self.in_flight.len(),
             visible_messages: self.get_visible_count(),
@@ -997,6 +1091,7 @@ impl AppState {
                                     in_flight: HashMap::new(),
                                     dedup_hashes: HashMap::new(),
                                     time_series: TimeSeriesTracker::new(24),
+                                    evicted_count: 0,
                                 };
                                 
                                 // For tests, just insert directly without spawning
@@ -1044,6 +1139,7 @@ impl AppState {
         let _ = REGISTRY.register(Box::new(DUPLICATE_MESSAGES_REJECTED_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(MESSAGES_EXPIRED_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(MESSAGES_MOVED_TO_DLQ_TOTAL.clone()));
+        let _ = REGISTRY.register(Box::new(MESSAGES_EVICTED_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(QUEUES_CREATED_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(QUEUES_DELETED_TOTAL.clone()));
         let _ = REGISTRY.register(Box::new(QUEUES_PURGED_TOTAL.clone()));
@@ -1100,6 +1196,9 @@ pub struct CreateQueueRequest {
     pub dead_letter_queue: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_receive_count: Option<u32>,
+    /// Maximum number of messages (pending + in-flight) the queue may hold. 0 or omitted = unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_queue_size: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -1116,6 +1215,14 @@ pub struct UpdateQueueRequest {
     pub dead_letter_queue: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_receive_count: Option<u32>,
+    /// New size cap for the queue. 0 removes the cap; omitted leaves it unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_queue_size: Option<usize>,
+}
+
+/// Treat a 0 cap as "unbounded" so clients have a way to clear the limit.
+pub fn normalize_max_queue_size(max_queue_size: Option<usize>) -> Option<usize> {
+    max_queue_size.filter(|max| *max > 0)
 }
 
 pub fn default_visibility_timeout() -> u64 {
@@ -1237,6 +1344,11 @@ pub struct QueueDetailInfo {
     pub dead_letter_queue: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_receive_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_queue_size: Option<usize>,
+    /// Messages that still fit before the cap is reached (absent when uncapped)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_capacity: Option<usize>,
     pub messages_pending: usize,
     pub messages_in_flight: usize,
     pub visible_messages: usize,
@@ -1267,6 +1379,8 @@ pub struct QueueInfo {
     pub dead_letter_queue: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_receive_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_queue_size: Option<usize>,
 }
 
 // Query parameters for time-series endpoints
@@ -1335,7 +1449,8 @@ pub async fn create_queue(
         req.default_message_ttl_seconds,
         req.dead_letter_queue,
         req.max_receive_count,
-    );
+    )
+    .with_max_queue_size(req.max_queue_size);
     let spec = queue.spec.clone();
     
     if let Err(e) = state.save_queue_spec(&spec).await {
@@ -1423,6 +1538,28 @@ pub async fn update_queue_settings(
             updated = true;
         }
 
+        // A size cap applies immediately: anything already over the new limit is evicted
+        let mut evicted = 0;
+        let mut applied_cap = None;
+        if let Some(max_queue_size) = req.max_queue_size {
+            queue.spec.max_queue_size = normalize_max_queue_size(Some(max_queue_size));
+            evicted = queue.enforce_capacity();
+            queue.take_evicted_count();
+            applied_cap = queue.spec.max_queue_size;
+            updated = true;
+        }
+
+        if evicted > 0 {
+            let queue_depth = queue.size();
+            state.event_broadcaster.broadcast(QueueEvent::MessagesEvicted {
+                queue_name: queue_name.clone(),
+                count: evicted,
+                queue_depth,
+                max_queue_size: applied_cap.unwrap_or(0),
+                timestamp: Utc::now(),
+            });
+        }
+
         if updated {
             let spec = queue.spec.clone();
             if let Err(e) = state.save_queue_spec(&spec).await {
@@ -1468,6 +1605,7 @@ pub async fn list_queues(State(state): State<AppState>) -> Json<Vec<QueueInfo>> 
             default_message_ttl_seconds: queue.spec.default_message_ttl_seconds,
             dead_letter_queue: queue.spec.dead_letter_queue.clone(),
             max_receive_count: queue.spec.max_receive_count,
+            max_queue_size: queue.spec.max_queue_size,
         })
         .collect();
     
@@ -1532,7 +1670,10 @@ pub async fn enqueue_message(
     let mut queues = state.queues.write().await;
 
     if let Some(queue) = queues.get_mut(&queue_name) {
-        match queue.enqueue(req.content, req.ttl_seconds, req.delay_seconds, req.priority) {
+        let result = queue.enqueue(req.content, req.ttl_seconds, req.delay_seconds, req.priority);
+        broadcast_evictions(&state, queue, &queue_name);
+
+        match result {
             Ok(id) => Ok(Json(EnqueueResponse { id, error: None })),
             Err(e) => {
                 warn!("Failed to enqueue message: {}", e);
@@ -1545,6 +1686,22 @@ pub async fn enqueue_message(
     } else {
         Err(StatusCode::NOT_FOUND)
     }
+}
+
+/// Drain any messages the size cap dropped and announce them on the event stream.
+fn broadcast_evictions(state: &AppState, queue: &mut Queue, queue_name: &str) {
+    let evicted = queue.take_evicted_count();
+    if evicted == 0 {
+        return;
+    }
+
+    state.event_broadcaster.broadcast(QueueEvent::MessagesEvicted {
+        queue_name: queue_name.to_string(),
+        count: evicted,
+        queue_depth: queue.size(),
+        max_queue_size: queue.spec.max_queue_size.unwrap_or(0),
+        timestamp: Utc::now(),
+    });
 }
 
 #[utoipa::path(
@@ -1576,13 +1733,14 @@ pub async fn enqueue_batch(
             .into_iter()
             .map(|result| match result {
                 Ok(id) => EnqueueResponse { id, error: None },
-                Err(e) => EnqueueResponse { 
-                    id: Uuid::nil(), 
-                    error: Some(e) 
+                Err(e) => EnqueueResponse {
+                    id: Uuid::nil(),
+                    error: Some(e)
                 }
             })
             .collect();
-        
+        broadcast_evictions(&state, queue, &queue_name);
+
         let successful = results.iter().filter(|r| r.error.is_none()).count();
         let failed = results.len() - successful;
         
@@ -1646,6 +1804,8 @@ pub async fn get_messages(
                             timestamp: Utc::now(),
                         });
                     }
+                    // The DLQ has its own cap, so the move may have pushed it over the limit
+                    broadcast_evictions(&state, dlq_queue, dlq_queue_name);
                 } else {
                     warn!("DLQ '{}' does not exist, discarding {} messages from '{}'",
                         dlq_queue_name, dequeue_result.dlq_messages.len(), queue_name);
@@ -1826,6 +1986,10 @@ pub fn get_duplicate_messages_rejected_total() -> u64 {
 
 pub fn get_messages_expired_total() -> u64 {
     MESSAGES_EXPIRED_TOTAL.get()
+}
+
+pub fn get_messages_evicted_total() -> u64 {
+    MESSAGES_EVICTED_TOTAL.get()
 }
 
 pub fn get_messages_moved_to_dlq_total() -> u64 {
@@ -2780,5 +2944,137 @@ mod tests {
             Some("dlq".to_string()), Some(0),
         );
         assert_eq!(queue.spec.max_receive_count, Some(0));
+    }
+
+    fn capped_queue(name: &str, max_queue_size: usize) -> Queue {
+        Queue::new(name.to_string(), 30, false, 300, None, None, None)
+            .with_max_queue_size(Some(max_queue_size))
+    }
+
+    #[test]
+    fn test_max_queue_size_drops_oldest_message() {
+        let mut queue = capped_queue("capped", 3);
+
+        for i in 0..3 {
+            queue.enqueue(format!("message {}", i), None, None, None).unwrap();
+        }
+        assert_eq!(queue.size(), 3);
+        assert_eq!(queue.remaining_capacity(), Some(0));
+
+        // The fourth message pushes the queue over its cap, so the oldest one is dropped
+        queue.enqueue("message 3".to_string(), None, None, None).unwrap();
+        assert_eq!(queue.size(), 3, "queue must not grow past its cap");
+        assert_eq!(queue.take_evicted_count(), 1);
+        assert_eq!(queue.take_evicted_count(), 0, "eviction count drains");
+
+        let contents: Vec<String> = queue
+            .iter_all_pending()
+            .map(|m| m.get_content_string())
+            .collect();
+        assert_eq!(contents, vec!["message 1", "message 2", "message 3"]);
+    }
+
+    #[test]
+    fn test_max_queue_size_evicts_lowest_priority_first() {
+        let mut queue = capped_queue("capped", 2);
+
+        queue.enqueue("urgent".to_string(), None, None, Some(9)).unwrap();
+        queue.enqueue("normal".to_string(), None, None, Some(5)).unwrap();
+        queue.enqueue("bulk".to_string(), None, None, Some(1)).unwrap();
+
+        // The lowest-priority message is the one that gets dropped, not the oldest overall
+        let contents: Vec<String> = queue
+            .iter_all_pending()
+            .map(|m| m.get_content_string())
+            .collect();
+        assert_eq!(contents, vec!["urgent", "normal"]);
+        assert_eq!(queue.take_evicted_count(), 1);
+    }
+
+    #[test]
+    fn test_max_queue_size_counts_in_flight_messages() {
+        let mut queue = capped_queue("capped", 2);
+
+        queue.enqueue("first".to_string(), None, None, None).unwrap();
+        queue.enqueue("second".to_string(), None, None, None).unwrap();
+
+        // Both messages are handed to a consumer, so the cap is fully taken by in-flight work
+        let dequeued = queue.dequeue(2);
+        assert_eq!(dequeued.messages.len(), 2);
+        assert_eq!(queue.size(), 2);
+        assert_eq!(queue.remaining_capacity(), Some(0));
+
+        // In-flight messages cannot be evicted, so the write is rejected instead
+        let result = queue.enqueue("third".to_string(), None, None, None);
+        assert!(result.is_err(), "expected rejection, got {:?}", result);
+        assert!(result.unwrap_err().contains("full"));
+        assert_eq!(queue.size(), 2);
+
+        // Acking one message frees a slot again
+        let handle = dequeued.messages[0].receipt_handle.unwrap();
+        assert!(queue.delete_message(handle));
+        assert!(queue.enqueue("third".to_string(), None, None, None).is_ok());
+        assert_eq!(queue.size(), 2);
+    }
+
+    #[test]
+    fn test_uncapped_queue_grows_freely() {
+        let mut queue = Queue::new("unbounded".to_string(), 30, false, 300, None, None, None);
+        assert_eq!(queue.remaining_capacity(), None);
+
+        for i in 0..50 {
+            queue.enqueue(format!("message {}", i), None, None, None).unwrap();
+        }
+        assert_eq!(queue.size(), 50);
+        assert_eq!(queue.take_evicted_count(), 0);
+    }
+
+    #[test]
+    fn test_zero_max_queue_size_means_unbounded() {
+        let queue = Queue::new("test".to_string(), 30, false, 300, None, None, None)
+            .with_max_queue_size(Some(0));
+        assert_eq!(queue.spec.max_queue_size, None);
+        assert_eq!(normalize_max_queue_size(Some(0)), None);
+        assert_eq!(normalize_max_queue_size(Some(10)), Some(10));
+        assert_eq!(normalize_max_queue_size(None), None);
+    }
+
+    #[test]
+    fn test_lowering_cap_evicts_existing_overflow() {
+        let mut queue = Queue::new("test".to_string(), 30, false, 300, None, None, None);
+        for i in 0..10 {
+            queue.enqueue(format!("message {}", i), None, None, None).unwrap();
+        }
+
+        queue.spec.max_queue_size = Some(4);
+        assert_eq!(queue.enforce_capacity(), 6);
+        assert_eq!(queue.size(), 4);
+
+        let contents: Vec<String> = queue
+            .iter_all_pending()
+            .map(|m| m.get_content_string())
+            .collect();
+        assert_eq!(
+            contents,
+            vec!["message 6", "message 7", "message 8", "message 9"]
+        );
+    }
+
+    #[test]
+    fn test_dlq_moves_respect_the_dlq_cap() {
+        let mut dlq = capped_queue("dlq", 1);
+        dlq.enqueue("old poison".to_string(), None, None, None).unwrap();
+
+        let mut source = Queue::new("source".to_string(), 30, false, 300, None, None, None);
+        source.enqueue("new poison".to_string(), None, None, None).unwrap();
+        let msg = source.dequeue(1).messages.remove(0);
+
+        dlq.push_message(msg);
+        assert_eq!(dlq.size(), 1, "DLQ must respect its own cap");
+        assert_eq!(dlq.take_evicted_count(), 1);
+        assert_eq!(
+            dlq.iter_all_pending().next().unwrap().get_content_string(),
+            "new poison"
+        );
     }
 }

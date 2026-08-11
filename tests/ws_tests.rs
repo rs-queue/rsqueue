@@ -124,6 +124,7 @@ mod ws_handler {
                 QueueEvent::QueuePurged { queue_name, .. } => Some(queue_name.as_str()),
                 QueueEvent::QueueDeleted { queue_name, .. } => Some(queue_name.as_str()),
                 QueueEvent::QueueCreated { queue_name, .. } => Some(queue_name.as_str()),
+                QueueEvent::MessagesEvicted { queue_name, .. } => Some(queue_name.as_str()),
                 QueueEvent::MessageMovedToDLQ { source_queue, dlq_queue, .. } => {
                     if self.subscribed_queues.contains(source_queue.as_str())
                         || self.subscribed_queues.contains(dlq_queue.as_str())
