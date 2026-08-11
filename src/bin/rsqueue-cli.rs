@@ -10,7 +10,7 @@ use tungstenite::connect;
 #[command(about = "CLI tool for RSQueue operations", long_about = None)]
 struct Cli {
     /// RSQueue server URL
-    #[arg(short, long, default_value = "http://localhost:4000", env = "RSQUEUE_URL")]
+    #[arg(long, default_value = "http://localhost:4000", env = "RSQUEUE_URL")]
     url: String,
 
     /// Basic auth username (optional)
@@ -20,6 +20,10 @@ struct Cli {
     /// Basic auth password (optional)
     #[arg(short = 'p', long, env = "RSQUEUE_PASSWORD")]
     password: Option<String>,
+
+    /// API Key for authentication (optional)
+    #[arg(short = 'k', long, env = "RSQUEUE_API_KEY")]
+    api_key: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -55,10 +59,23 @@ enum Commands {
         /// Max receive count before moving to DLQ
         #[arg(long)]
         max_receive_count: Option<u32>,
+
+        /// Max messages (pending + in-flight) to hold before dropping the oldest
+        #[arg(long)]
+        max_size: Option<usize>,
     },
 
     /// List all queues
     List,
+
+    /// Set (or clear) the size cap on an existing queue
+    SetLimit {
+        /// Name of the queue
+        name: String,
+
+        /// Max messages to hold; 0 removes the cap
+        max_size: usize,
+    },
 
     /// Delete a queue
     Delete {
@@ -173,11 +190,13 @@ fn main() {
             compress,
             dlq,
             max_receive_count,
+            max_size,
         } => create_queue(
             &client,
             &cli.url,
             cli.user.as_deref(),
             cli.password.as_deref(),
+            cli.api_key.as_deref(),
             &name,
             visibility_timeout,
             dedup,
@@ -185,6 +204,7 @@ fn main() {
             compress,
             dlq.as_deref(),
             max_receive_count,
+            max_size,
         ),
 
         Commands::List => list_queues(
@@ -192,6 +212,17 @@ fn main() {
             &cli.url,
             cli.user.as_deref(),
             cli.password.as_deref(),
+            cli.api_key.as_deref(),
+        ),
+
+        Commands::SetLimit { name, max_size } => set_queue_limit(
+            &client,
+            &cli.url,
+            cli.user.as_deref(),
+            cli.password.as_deref(),
+            cli.api_key.as_deref(),
+            &name,
+            max_size,
         ),
 
         Commands::Delete { name } => delete_queue(
@@ -199,6 +230,7 @@ fn main() {
             &cli.url,
             cli.user.as_deref(),
             cli.password.as_deref(),
+            cli.api_key.as_deref(),
             &name,
         ),
 
@@ -207,6 +239,7 @@ fn main() {
             &cli.url,
             cli.user.as_deref(),
             cli.password.as_deref(),
+            cli.api_key.as_deref(),
             &name,
         ),
 
@@ -221,6 +254,7 @@ fn main() {
             &cli.url,
             cli.user.as_deref(),
             cli.password.as_deref(),
+            cli.api_key.as_deref(),
             &queue,
             &content,
             ttl,
@@ -233,6 +267,7 @@ fn main() {
             &cli.url,
             cli.user.as_deref(),
             cli.password.as_deref(),
+            cli.api_key.as_deref(),
             &queue,
             count,
         ),
@@ -245,6 +280,7 @@ fn main() {
             &cli.url,
             cli.user.as_deref(),
             cli.password.as_deref(),
+            cli.api_key.as_deref(),
             &queue,
             &receipt_handle,
         ),
@@ -254,6 +290,7 @@ fn main() {
             &cli.url,
             cli.user.as_deref(),
             cli.password.as_deref(),
+            cli.api_key.as_deref(),
             &name,
         ),
 
@@ -262,6 +299,7 @@ fn main() {
             &cli.url,
             cli.user.as_deref(),
             cli.password.as_deref(),
+            cli.api_key.as_deref(),
             &name,
         ),
 
@@ -274,6 +312,7 @@ fn main() {
             &cli.url,
             cli.user.as_deref(),
             cli.password.as_deref(),
+            cli.api_key.as_deref(),
             &queue,
             count,
             offset,
@@ -300,11 +339,16 @@ fn build_request(
     url: &str,
     user: Option<&str>,
     password: Option<&str>,
+    api_key: Option<&str>,
 ) -> reqwest::blocking::RequestBuilder {
     let mut req = client.request(method, url);
 
     if let (Some(u), Some(p)) = (user, password) {
         req = req.basic_auth(u, Some(p));
+    }
+
+    if let Some(key) = api_key {
+        req = req.header("X-Api-Key", key);
     }
 
     req
@@ -315,6 +359,7 @@ fn create_queue(
     base_url: &str,
     user: Option<&str>,
     password: Option<&str>,
+    api_key: Option<&str>,
     name: &str,
     visibility_timeout: u64,
     dedup: bool,
@@ -322,6 +367,7 @@ fn create_queue(
     compress: bool,
     dlq: Option<&str>,
     max_receive_count: Option<u32>,
+    max_size: Option<usize>,
 ) -> Result<(), String> {
     let url = format!("{}/queues", base_url);
     let mut body = json!({
@@ -338,8 +384,11 @@ fn create_queue(
     if let Some(count) = max_receive_count {
         body["max_receive_count"] = json!(count);
     }
+    if let Some(size) = max_size {
+        body["max_queue_size"] = json!(size);
+    }
 
-    let response = build_request(client, reqwest::Method::POST, &url, user, password)
+    let response = build_request(client, reqwest::Method::POST, &url, user, password, api_key)
         .json(&body)
         .send()
         .map_err(|e| format!("Request failed: {}", e))?;
@@ -364,10 +413,11 @@ fn list_queues(
     base_url: &str,
     user: Option<&str>,
     password: Option<&str>,
+    api_key: Option<&str>,
 ) -> Result<(), String> {
     let url = format!("{}/queues", base_url);
 
-    let response = build_request(client, reqwest::Method::GET, &url, user, password)
+    let response = build_request(client, reqwest::Method::GET, &url, user, password, api_key)
         .send()
         .map_err(|e| format!("Request failed: {}", e))?;
 
@@ -382,16 +432,56 @@ fn list_queues(
     }
 }
 
+fn set_queue_limit(
+    client: &Client,
+    base_url: &str,
+    user: Option<&str>,
+    password: Option<&str>,
+    api_key: Option<&str>,
+    name: &str,
+    max_size: usize,
+) -> Result<(), String> {
+    let url = format!("{}/queues/{}/settings", base_url, name);
+    let body = json!({ "max_queue_size": max_size });
+
+    let response = build_request(client, reqwest::Method::PUT, &url, user, password, api_key)
+        .json(&body)
+        .send()
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if response.status().is_success() {
+        let spec: serde_json::Value = response
+            .json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+        if max_size == 0 {
+            println!("Size cap removed from queue '{}'", name);
+        } else {
+            println!(
+                "Queue '{}' capped at {} messages (oldest are dropped when full)",
+                name, max_size
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&spec).unwrap());
+        Ok(())
+    } else {
+        Err(format!(
+            "Failed to set queue limit: HTTP {}",
+            response.status()
+        ))
+    }
+}
+
 fn delete_queue(
     client: &Client,
     base_url: &str,
     user: Option<&str>,
     password: Option<&str>,
+    api_key: Option<&str>,
     name: &str,
 ) -> Result<(), String> {
     let url = format!("{}/queues/{}", base_url, name);
 
-    let response = build_request(client, reqwest::Method::DELETE, &url, user, password)
+    let response = build_request(client, reqwest::Method::DELETE, &url, user, password, api_key)
         .send()
         .map_err(|e| format!("Request failed: {}", e))?;
 
@@ -408,11 +498,12 @@ fn purge_queue(
     base_url: &str,
     user: Option<&str>,
     password: Option<&str>,
+    api_key: Option<&str>,
     name: &str,
 ) -> Result<(), String> {
     let url = format!("{}/queues/{}/purge", base_url, name);
 
-    let response = build_request(client, reqwest::Method::POST, &url, user, password)
+    let response = build_request(client, reqwest::Method::POST, &url, user, password, api_key)
         .send()
         .map_err(|e| format!("Request failed: {}", e))?;
 
@@ -429,6 +520,7 @@ fn send_message(
     base_url: &str,
     user: Option<&str>,
     password: Option<&str>,
+    api_key: Option<&str>,
     queue: &str,
     content: &str,
     ttl: Option<u64>,
@@ -452,7 +544,7 @@ fn send_message(
         body["priority"] = json!(p);
     }
 
-    let response = build_request(client, reqwest::Method::POST, &url, user, password)
+    let response = build_request(client, reqwest::Method::POST, &url, user, password, api_key)
         .json(&body)
         .send()
         .map_err(|e| format!("Request failed: {}", e))?;
@@ -474,6 +566,7 @@ fn receive_messages(
     base_url: &str,
     user: Option<&str>,
     password: Option<&str>,
+    api_key: Option<&str>,
     queue: &str,
     count: usize,
 ) -> Result<(), String> {
@@ -482,7 +575,7 @@ fn receive_messages(
         "count": count,
     });
 
-    let response = build_request(client, reqwest::Method::POST, &url, user, password)
+    let response = build_request(client, reqwest::Method::POST, &url, user, password, api_key)
         .json(&body)
         .send()
         .map_err(|e| format!("Request failed: {}", e))?;
@@ -506,12 +599,13 @@ fn delete_message(
     base_url: &str,
     user: Option<&str>,
     password: Option<&str>,
+    api_key: Option<&str>,
     queue: &str,
     receipt_handle: &str,
 ) -> Result<(), String> {
     let url = format!("{}/queues/{}/messages/{}", base_url, queue, receipt_handle);
 
-    let response = build_request(client, reqwest::Method::DELETE, &url, user, password)
+    let response = build_request(client, reqwest::Method::DELETE, &url, user, password, api_key)
         .send()
         .map_err(|e| format!("Request failed: {}", e))?;
 
@@ -531,11 +625,12 @@ fn get_details(
     base_url: &str,
     user: Option<&str>,
     password: Option<&str>,
+    api_key: Option<&str>,
     name: &str,
 ) -> Result<(), String> {
     let url = format!("{}/queues/{}/details", base_url, name);
 
-    let response = build_request(client, reqwest::Method::GET, &url, user, password)
+    let response = build_request(client, reqwest::Method::GET, &url, user, password, api_key)
         .send()
         .map_err(|e| format!("Request failed: {}", e))?;
 
@@ -555,11 +650,12 @@ fn get_metrics(
     base_url: &str,
     user: Option<&str>,
     password: Option<&str>,
+    api_key: Option<&str>,
     name: &str,
 ) -> Result<(), String> {
     let url = format!("{}/queues/{}/metrics", base_url, name);
 
-    let response = build_request(client, reqwest::Method::GET, &url, user, password)
+    let response = build_request(client, reqwest::Method::GET, &url, user, password, api_key)
         .send()
         .map_err(|e| format!("Request failed: {}", e))?;
 
@@ -579,6 +675,7 @@ fn peek_messages(
     base_url: &str,
     user: Option<&str>,
     password: Option<&str>,
+    api_key: Option<&str>,
     queue: &str,
     count: usize,
     offset: usize,
@@ -589,7 +686,7 @@ fn peek_messages(
         "offset": offset,
     });
 
-    let response = build_request(client, reqwest::Method::POST, &url, user, password)
+    let response = build_request(client, reqwest::Method::POST, &url, user, password, api_key)
         .json(&body)
         .send()
         .map_err(|e| format!("Request failed: {}", e))?;

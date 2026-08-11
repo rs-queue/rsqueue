@@ -1,6 +1,6 @@
 use axum::{
     http::StatusCode,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use axum_test::TestServer;
@@ -155,6 +155,8 @@ async fn create_test_app() -> TestServer {
         .route("/queues", post(create_queue))
         .route("/queues", get(list_queues))
         .route("/queues/:name", delete(delete_queue))
+        .route("/queues/:name/settings", put(update_queue_settings))
+        .route("/queues/:name/details", get(get_queue_details))
         .route("/queues/:name/purge", post(purge_queue))
         .route("/queues/:name/messages", post(enqueue_message))
         .route("/queues/:name/messages/batch", post(enqueue_batch))
@@ -177,6 +179,7 @@ async fn test_create_queue_endpoint() {
         default_message_ttl_seconds: None,
         dead_letter_queue: None,
         max_receive_count: None,
+        max_queue_size: None,
     };
     
     let response = server
@@ -203,6 +206,7 @@ async fn test_list_queues_endpoint() {
         default_message_ttl_seconds: None,
         dead_letter_queue: None,
         max_receive_count: None,
+        max_queue_size: None,
     };
 
     server.post("/queues").json(&request).await.assert_status_ok();
@@ -229,6 +233,7 @@ async fn test_enqueue_message_endpoint() {
         default_message_ttl_seconds: None,
         dead_letter_queue: None,
         max_receive_count: None,
+        max_queue_size: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
 
@@ -264,6 +269,7 @@ async fn test_get_messages_endpoint() {
         default_message_ttl_seconds: None,
         dead_letter_queue: None,
         max_receive_count: None,
+        max_queue_size: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
     
@@ -303,6 +309,7 @@ async fn test_delete_message_endpoint() {
         default_message_ttl_seconds: None,
         dead_letter_queue: None,
         max_receive_count: None,
+        max_queue_size: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
     
@@ -341,6 +348,7 @@ async fn test_batch_enqueue_endpoint() {
         default_message_ttl_seconds: None,
         dead_letter_queue: None,
         max_receive_count: None,
+        max_queue_size: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
     
@@ -378,6 +386,7 @@ async fn test_purge_queue_endpoint() {
         default_message_ttl_seconds: None,
         dead_letter_queue: None,
         max_receive_count: None,
+        max_queue_size: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
     
@@ -412,6 +421,7 @@ async fn test_delete_queue_endpoint() {
         default_message_ttl_seconds: None,
         dead_letter_queue: None,
         max_receive_count: None,
+        max_queue_size: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
     
@@ -438,6 +448,7 @@ async fn test_deduplication_endpoint() {
         default_message_ttl_seconds: None,
         dead_letter_queue: None,
         max_receive_count: None,
+        max_queue_size: None,
     };
     server.post("/queues").json(&create_request).await.assert_status_ok();
     
@@ -474,6 +485,7 @@ async fn test_create_queue_with_dlq_config() {
         default_message_ttl_seconds: None,
         dead_letter_queue: None,
         max_receive_count: None,
+        max_queue_size: None,
     };
     server.post("/queues").json(&dlq_request).await.assert_status_ok();
 
@@ -486,6 +498,7 @@ async fn test_create_queue_with_dlq_config() {
         default_message_ttl_seconds: None,
         dead_letter_queue: Some("my-dlq".to_string()),
         max_receive_count: Some(3),
+        max_queue_size: None,
     };
     let response = server.post("/queues").json(&create_request).await;
     response.assert_status_ok();
@@ -506,6 +519,7 @@ async fn test_create_queue_self_referential_dlq_rejected() {
         default_message_ttl_seconds: None,
         dead_letter_queue: Some("self-ref".to_string()),
         max_receive_count: Some(3),
+        max_queue_size: None,
     };
     let response = server.post("/queues").json(&create_request).await;
     response.assert_status(StatusCode::BAD_REQUEST);
@@ -587,4 +601,144 @@ async fn test_in_memory_compression() {
     assert_eq!(dequeue_result.messages[0].content.as_deref().unwrap(), &large_payload);
     
     // Check internal storage size if possible (optional, but we know the API works)
+}
+fn capped_queue_request(name: &str, max_queue_size: Option<usize>) -> CreateQueueRequest {
+    CreateQueueRequest {
+        name: name.to_string(),
+        visibility_timeout_seconds: 120,
+        enable_deduplication: false,
+        deduplication_window_seconds: 300,
+        default_message_ttl_seconds: None,
+        dead_letter_queue: None,
+        max_receive_count: None,
+        max_queue_size,
+    }
+}
+
+async fn send(server: &TestServer, queue: &str, content: &str) -> EnqueueResponse {
+    server
+        .post(&format!("/queues/{}/messages", queue))
+        .json(&EnqueueRequest {
+            content: content.to_string(),
+            ttl_seconds: None,
+            delay_seconds: None,
+            priority: None,
+        })
+        .await
+        .json()
+}
+
+#[tokio::test]
+async fn test_capped_queue_stops_growing() {
+    let server = create_test_app().await;
+    server
+        .post("/queues")
+        .json(&capped_queue_request("capped", Some(3)))
+        .await
+        .assert_status_ok();
+
+    for i in 0..10 {
+        let result = send(&server, "capped", &format!("message {}", i)).await;
+        assert!(result.error.is_none(), "unexpected error: {:?}", result.error);
+    }
+
+    let queues: Vec<QueueInfo> = server.get("/queues").await.json();
+    let capped = queues.iter().find(|q| q.name == "capped").unwrap();
+    assert_eq!(capped.size, 3, "queue grew past its cap");
+    assert_eq!(capped.max_queue_size, Some(3));
+
+    // The three most recent messages are the survivors
+    let details: QueueDetailInfo = server.get("/queues/capped/details").await.json();
+    assert_eq!(details.remaining_capacity, Some(0));
+    let contents: Vec<String> = details
+        .recent_messages
+        .iter()
+        .map(|m| m.content.clone())
+        .collect();
+    assert_eq!(contents, vec!["message 7", "message 8", "message 9"]);
+}
+
+#[tokio::test]
+async fn test_uncapped_queue_endpoint_reports_no_limit() {
+    let server = create_test_app().await;
+    server
+        .post("/queues")
+        .json(&capped_queue_request("unbounded", None))
+        .await
+        .assert_status_ok();
+
+    for i in 0..20 {
+        send(&server, "unbounded", &format!("message {}", i)).await;
+    }
+
+    let queues: Vec<QueueInfo> = server.get("/queues").await.json();
+    let queue = queues.iter().find(|q| q.name == "unbounded").unwrap();
+    assert_eq!(queue.size, 20);
+    assert_eq!(queue.max_queue_size, None);
+}
+
+#[tokio::test]
+async fn test_setting_cap_on_existing_queue_trims_it() {
+    let server = create_test_app().await;
+    server
+        .post("/queues")
+        .json(&capped_queue_request("busy", None))
+        .await
+        .assert_status_ok();
+
+    for i in 0..8 {
+        send(&server, "busy", &format!("message {}", i)).await;
+    }
+
+    // Capping an oversized queue takes effect immediately
+    let response = server
+        .put("/queues/busy/settings")
+        .json(&serde_json::json!({ "max_queue_size": 2 }))
+        .await;
+    response.assert_status_ok();
+    let spec: QueueSpec = response.json();
+    assert_eq!(spec.max_queue_size, Some(2));
+
+    let queues: Vec<QueueInfo> = server.get("/queues").await.json();
+    assert_eq!(queues.iter().find(|q| q.name == "busy").unwrap().size, 2);
+
+    // 0 clears the cap again
+    let response = server
+        .put("/queues/busy/settings")
+        .json(&serde_json::json!({ "max_queue_size": 0 }))
+        .await;
+    response.assert_status_ok();
+    let spec: QueueSpec = response.json();
+    assert_eq!(spec.max_queue_size, None);
+
+    for i in 0..5 {
+        send(&server, "busy", &format!("more {}", i)).await;
+    }
+    let queues: Vec<QueueInfo> = server.get("/queues").await.json();
+    assert_eq!(queues.iter().find(|q| q.name == "busy").unwrap().size, 7);
+}
+
+#[tokio::test]
+async fn test_capped_queue_survives_restart() {
+    let temp_path = env::temp_dir().join(format!("rsqueue_test_{}", uuid::Uuid::new_v4()));
+    let state = AppState::new(temp_path.clone());
+    let app = Router::new()
+        .route("/queues", post(create_queue))
+        .with_state(state);
+    let server = TestServer::new(app).unwrap();
+
+    server
+        .post("/queues")
+        .json(&capped_queue_request("persisted", Some(42)))
+        .await
+        .assert_status_ok();
+
+    // A fresh AppState reloads specs from disk (on a spawned task, so give it a moment)
+    let reloaded = AppState::new(temp_path);
+    tokio::time::sleep(StdDuration::from_millis(100)).await;
+    let queues = reloaded.queues.read().await;
+    assert_eq!(
+        queues.get("persisted").unwrap().spec.max_queue_size,
+        Some(42)
+    );
 }

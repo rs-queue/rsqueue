@@ -12,6 +12,7 @@ A high-performance, thread-safe message queue service written in Rust with HTTP 
 - ⏰ **Delayed/Scheduled Messages**: Schedule messages for future delivery with delay_seconds parameter
 - 🔢 **Message Priorities**: Priority levels 0-9 (higher = higher priority), dequeued highest-first with FIFO within same level
 - 💀 **Dead Letter Queue**: Automatically move poison messages to a DLQ after configurable max receive count
+- 📏 **Queue Size Caps**: Bound a queue with `max_queue_size` — when full, the oldest lowest-priority message is dropped
 - 📝 **Persistent Queue Specs**: Queue configurations survive server restarts
 - 🔄 **Automatic Re-queueing**: Unprocessed messages automatically return to the queue
 - 📦 **Batch Operations**: Enqueue and delete multiple messages in a single request
@@ -167,10 +168,22 @@ rsqueue-cli delete-message task-queue 650e8400-e29b-41d4-a716-446655440001
     "name": "string",
     "visibility_timeout_seconds": 120,   // optional, defaults to 120
     "dead_letter_queue": "dlq-name",     // optional, target DLQ queue name
-    "max_receive_count": 5               // optional, move to DLQ after N receives
+    "max_receive_count": 5,              // optional, move to DLQ after N receives
+    "max_queue_size": 10000              // optional, max messages held (0/omitted = unbounded)
   }
   ```
 - **Returns**: Queue specification
+
+#### Update Queue Settings
+- **PUT** `/queues/{queue_name}/settings`
+- **Body**: any subset of the create options, e.g.
+  ```json
+  {
+    "max_queue_size": 5000   // 0 removes the cap; omitted leaves it unchanged
+  }
+  ```
+- **Description**: A new size cap applies immediately — anything already over the limit is evicted
+- **Returns**: Updated queue specification
 
 #### List All Queues
 - **GET** `/queues`
@@ -252,6 +265,15 @@ rsqueue-cli delete-message task-queue 650e8400-e29b-41d4-a716-446655440001
 
 ## Configuration
 
+### Authentication
+
+RSQueue supports two methods for securing the API, configured via environment variables on the server:
+
+- **Basic Authentication**: Set `AUTH_USER` and `AUTH_PASSWORD`. Clients must send standard HTTP Basic Auth headers.
+- **API Keys**: Set `RSQUEUE_API_KEYS` to a comma-separated list of valid keys (e.g., `key1,key2`). Clients can authenticate by sending the `X-Api-Key` header or an `Authorization: Bearer <key>` header.
+
+If either is enabled, unauthenticated requests will be rejected with `401 Unauthorized`.
+
 ### Queue Settings
 
 - **`visibility_timeout_seconds`**: Duration (in seconds) that a message remains invisible after being retrieved. Default: 120 seconds (2 minutes)
@@ -259,6 +281,41 @@ rsqueue-cli delete-message task-queue 650e8400-e29b-41d4-a716-446655440001
 - **`deduplication_window_seconds`**: How long to remember message hashes for deduplication. Default: 300 seconds (5 minutes)
 - **`dead_letter_queue`**: Name of the queue to move poison messages to after `max_receive_count` is exceeded. Default: none (disabled)
 - **`max_receive_count`**: Number of times a message can be received before being moved to the dead letter queue. Must be >= 1. Default: none (disabled)
+- **`max_queue_size`**: Maximum number of messages the queue may hold, counting both pending and in-flight messages. Default: none (unbounded)
+
+### Queue Size Caps
+
+Messages live in memory, so an unbounded queue with a slow (or absent) consumer will grow until the
+process runs out of RAM. Setting `max_queue_size` bounds a queue:
+
+- When a full queue receives a new message, the **oldest message in the lowest-priority bucket** is
+  dropped to make room, so high-priority work survives an overflow. This is silent data loss by
+  design — pick the cap accordingly, and use a DLQ if you need the discarded work back.
+- Evictions are visible everywhere: the `rsqueue_messages_evicted_total` Prometheus counter, the
+  `messages_evicted_total` field on `/metrics/summary`, a `messages_evicted` event on the SSE and
+  WebSocket streams, and a "Dropped (Over Cap)" tile plus per-queue capacity bar on the dashboard.
+- In-flight messages count toward the cap but can never be evicted (a consumer owns them). If
+  in-flight messages alone fill the cap, enqueues are rejected with an `error` in the response until
+  those messages are acked or their visibility timeout expires.
+- Lowering the cap on an existing queue trims it immediately; setting it to `0` removes the cap.
+- Dead letter queues honour their own cap, so a DLQ cannot grow unbounded either.
+
+```bash
+# Cap at creation time
+curl -X POST http://localhost:4000/queues \
+  -H "Content-Type: application/json" \
+  -d '{"name": "jobs", "max_queue_size": 10000}'
+
+# Cap (or uncap) an existing queue
+curl -X PUT http://localhost:4000/queues/jobs/settings \
+  -H "Content-Type: application/json" \
+  -d '{"max_queue_size": 5000}'
+
+# Or use the CLI tool
+rsqueue-cli create jobs --max-size 10000
+rsqueue-cli set-limit jobs 5000
+rsqueue-cli set-limit jobs 0        # remove the cap
+```
 
 ### Message Options
 
@@ -278,6 +335,12 @@ The rsqueue-cli tool provides a convenient command-line interface:
 ```bash
 # Create a queue
 rsqueue-cli create my-queue --visibility-timeout 120 --dedup
+
+# Create a bounded queue (oldest messages are dropped once it is full)
+rsqueue-cli create my-queue --max-size 10000
+
+# Change or remove the size cap later (0 = unlimited)
+rsqueue-cli set-limit my-queue 5000
 
 # List all queues
 rsqueue-cli list
@@ -311,8 +374,13 @@ The CLI tool supports configuration via environment variables:
 
 ```bash
 export RSQUEUE_URL=http://localhost:4000
+
+# For Basic Auth
 export RSQUEUE_USER=admin
 export RSQUEUE_PASSWORD=secret
+
+# OR For API Key Auth
+export RSQUEUE_API_KEY=my-secret-key
 
 rsqueue-cli list
 ```
@@ -529,6 +597,7 @@ MIT License - feel free to use this in your projects!
 - [x] Queue statistics and performance tracking
 - [x] Implement message priorities
 - [x] Add dead letter queue support
+- [x] Bounded queues with a configurable size cap
 - [ ] Create distributed version with clustering
 - [ ] Add message compression
 - [ ] Implement persistence options (RocksDB, PostgreSQL)

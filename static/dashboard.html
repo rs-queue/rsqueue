@@ -180,6 +180,10 @@
             border-left-color: #ffad1f;
         }
 
+        .event-item.evicted {
+            border-left-color: #f91880;
+        }
+
         .event-time {
             color: #71767b;
             font-size: 11px;
@@ -254,6 +258,48 @@
             text-transform: uppercase;
         }
 
+        .capacity {
+            margin-top: 10px;
+        }
+
+        .capacity-header {
+            display: flex;
+            justify-content: space-between;
+            font-size: 11px;
+            color: #71767b;
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+
+        .capacity-track {
+            height: 6px;
+            background: #1e2732;
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .capacity-fill {
+            height: 100%;
+            width: 0;
+            background: #00ba7c;
+            border-radius: 3px;
+            transition: width 0.3s ease, background 0.3s ease;
+        }
+
+        .capacity-fill.warning {
+            background: #ffad1f;
+        }
+
+        .capacity-fill.danger {
+            background: #f4212e;
+        }
+
+        .capacity-uncapped {
+            font-size: 11px;
+            color: #71767b;
+            text-transform: uppercase;
+        }
+
         .flow-visualization {
             background: #1e2732;
             border-radius: 12px;
@@ -314,6 +360,14 @@
 
         .btn-danger:hover {
             background: #dc1e28;
+        }
+
+        .btn-secondary {
+            background: #2f3336;
+        }
+
+        .btn-secondary:hover {
+            background: #3d4145;
         }
 
         .controls {
@@ -449,6 +503,10 @@
                         <span class="metric-label">Messages Deleted</span>
                         <span id="totalDeleted" class="metric-value danger">0</span>
                     </div>
+                    <div class="metric">
+                        <span class="metric-label">Dropped (Over Cap)</span>
+                        <span id="totalEvicted" class="metric-value warning">0</span>
+                    </div>
                 </div>
 
                 <div class="card">
@@ -478,6 +536,7 @@
         <div id="queues" class="tab-content">
             <div class="controls">
                 <input type="text" id="newQueueName" placeholder="Queue name">
+                <input type="number" id="newQueueMaxSize" min="0" step="1" placeholder="Max messages (0 = unlimited)" style="width: 220px;">
                 <button class="btn" onclick="createQueue()">Create Queue</button>
                 <button class="btn" onclick="refreshQueues()">Refresh</button>
             </div>
@@ -511,7 +570,8 @@
             stats: {
                 enqueued: 0,
                 dequeued: 0,
-                deleted: 0
+                deleted: 0,
+                evicted: 0
             }
         };
 
@@ -599,6 +659,10 @@
                     eventClass = 'queue';
                     eventText = `Queue purged: ${event.queue_name}`;
                     break;
+                case 'messages_evicted':
+                    eventClass = 'evicted';
+                    eventText = `[${event.queue_name}] ${event.count} message(s) dropped - queue at cap ${event.max_queue_size} (depth: ${event.queue_depth})`;
+                    break;
                 case 'metrics_update':
                     document.getElementById('activeQueues').textContent = event.active_queues;
                     document.getElementById('totalPending').textContent = event.total_pending;
@@ -650,6 +714,10 @@
                     state.stats.deleted += event.successful;
                     document.getElementById('totalDeleted').textContent = state.stats.deleted;
                     break;
+                case 'messages_evicted':
+                    state.stats.evicted += event.count;
+                    document.getElementById('totalEvicted').textContent = state.stats.evicted;
+                    break;
             }
         }
 
@@ -691,7 +759,9 @@
                         depth: q.size,
                         pending: q.size,
                         inFlight: 0,
-                        createdAt: q.created_at
+                        createdAt: q.created_at,
+                        // Absent when the queue is uncapped
+                        maxSize: q.max_queue_size ?? null
                     };
                 });
 
@@ -722,13 +792,17 @@
                                 <div class="queue-stat-label">Total</div>
                             </div>
                             <div class="queue-stat">
-                                <div class="queue-stat-value">${queue.pending}</div>
-                                <div class="queue-stat-label">Pending</div>
+                                <div class="queue-stat-value">${queue.maxSize ?? '&infin;'}</div>
+                                <div class="queue-stat-label">Cap</div>
                             </div>
                         </div>
+                        ${renderCapacity(queue)}
                         <div style="margin-top: 10px; display: flex; gap: 8px;">
                             <button class="btn" style="flex: 1; font-size: 12px;" onclick="sendTestMessage('${name}')">
                                 Send Message
+                            </button>
+                            <button class="btn btn-secondary" style="font-size: 12px;" onclick="setQueueLimit('${name}')">
+                                Set Limit
                             </button>
                             <button class="btn btn-danger" style="font-size: 12px;" onclick="deleteQueue('${name}')">
                                 Delete
@@ -739,25 +813,100 @@
             }).join('');
         }
 
+        function renderCapacity(queue) {
+            if (!queue.maxSize) {
+                return '<div class="capacity"><span class="capacity-uncapped">Unbounded - no size cap set</span></div>';
+            }
+
+            const used = Math.min(queue.depth / queue.maxSize, 1);
+            const percent = Math.round(used * 100);
+            const fillClass = percent >= 100 ? 'danger' : percent >= 80 ? 'warning' : '';
+
+            return `
+                <div class="capacity">
+                    <div class="capacity-header">
+                        <span>Capacity</span>
+                        <span>${queue.depth} / ${queue.maxSize} (${percent}%)</span>
+                    </div>
+                    <div class="capacity-track">
+                        <div class="capacity-fill ${fillClass}" style="width: ${percent}%"></div>
+                    </div>
+                </div>
+            `;
+        }
+
+        async function setQueueLimit(name) {
+            const queue = state.queues[name];
+            const current = queue && queue.maxSize ? String(queue.maxSize) : '0';
+            const input = prompt(
+                `Max messages for "${name}" (pending + in-flight).\n` +
+                `When full, the oldest lowest-priority message is dropped.\n` +
+                `Enter 0 to remove the cap.`,
+                current
+            );
+
+            if (input === null) return;
+
+            const maxSize = parseInt(input, 10);
+            if (isNaN(maxSize) || maxSize < 0) {
+                showNotification('Enter a whole number of messages (0 = unlimited)', 'warning');
+                return;
+            }
+
+            try {
+                const response = await fetch(`/queues/${name}/settings`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ max_queue_size: maxSize })
+                });
+
+                if (response.ok) {
+                    showNotification(maxSize === 0
+                        ? `Cap removed from "${name}"`
+                        : `"${name}" capped at ${maxSize} messages`);
+                    refreshQueues();
+                } else {
+                    showNotification('Failed to update queue limit', 'danger');
+                }
+            } catch (error) {
+                showNotification('Error updating queue limit', 'danger');
+            }
+        }
+
         async function createQueue() {
             const nameInput = document.getElementById('newQueueName');
+            const maxSizeInput = document.getElementById('newQueueMaxSize');
             const name = nameInput.value.trim();
+            const rawMaxSize = maxSizeInput.value.trim();
 
             if (!name) {
                 showNotification('Please enter a queue name', 'warning');
                 return;
             }
 
+            const body = { name };
+            if (rawMaxSize !== '') {
+                const maxSize = parseInt(rawMaxSize, 10);
+                if (isNaN(maxSize) || maxSize < 0) {
+                    showNotification('Max messages must be 0 or greater', 'warning');
+                    return;
+                }
+                body.max_queue_size = maxSize;
+            }
+
             try {
                 const response = await fetch('/queues', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name })
+                    body: JSON.stringify(body)
                 });
 
                 if (response.ok) {
                     nameInput.value = '';
-                    showNotification(`Queue "${name}" created`);
+                    maxSizeInput.value = '';
+                    showNotification(body.max_queue_size
+                        ? `Queue "${name}" created (cap ${body.max_queue_size})`
+                        : `Queue "${name}" created`);
                 } else {
                     showNotification('Failed to create queue', 'danger');
                 }
@@ -790,7 +939,13 @@
                 });
 
                 if (response.ok) {
-                    showNotification('Message sent');
+                    // A full queue answers 200 with an error field, same as a rejected duplicate
+                    const result = await response.json();
+                    if (result.error) {
+                        showNotification(result.error, 'warning');
+                    } else {
+                        showNotification('Message sent');
+                    }
                 }
             } catch (error) {
                 showNotification('Error sending message', 'danger');
@@ -860,6 +1015,9 @@
                 document.getElementById('activeQueues').textContent = metrics.active_queues;
                 document.getElementById('totalPending').textContent = metrics.total_messages_pending;
                 document.getElementById('totalInFlight').textContent = metrics.total_messages_in_flight;
+
+                state.stats.evicted = metrics.messages_evicted_total || 0;
+                document.getElementById('totalEvicted').textContent = state.stats.evicted;
             } catch (error) {
                 console.error('Failed to fetch initial metrics:', error);
             }
