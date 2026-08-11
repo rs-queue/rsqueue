@@ -274,7 +274,7 @@ async fn get_queue_metrics(
 }
 
 // Basic auth validator that compares against environment variables
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct BasicAuthValidator {
     username: String,
     password: String,
@@ -311,9 +311,87 @@ impl BasicAuthValidator {
     }
 }
 
-// Middleware function for basic authentication
-async fn basic_auth_middleware(
-    State(validator): State<BasicAuthValidator>,
+// API Key validator that checks against a list of valid keys
+#[derive(Clone, Default)]
+struct ApiKeyValidator {
+    valid_keys: Vec<String>,
+}
+
+impl ApiKeyValidator {
+    fn from_env() -> Option<Self> {
+        let keys_str = std::env::var("RSQUEUE_API_KEYS").ok()?;
+        let valid_keys: Vec<String> = keys_str
+            .split(',')
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .collect();
+            
+        if valid_keys.is_empty() {
+            return None;
+        }
+
+        Some(Self { valid_keys })
+    }
+
+    fn validate(&self, api_key_header: Option<&str>, auth_header: Option<&str>) -> bool {
+        // Check X-Api-Key header
+        if let Some(key) = api_key_header {
+            if self.valid_keys.contains(&key.to_string()) {
+                return true;
+            }
+        }
+        
+        // Check Bearer token in Authorization header
+        if let Some(auth_value) = auth_header {
+            if let Some(token) = auth_value.strip_prefix("Bearer ") {
+                if self.valid_keys.contains(&token.to_string()) {
+                    return true;
+                }
+            }
+        }
+        
+        false
+    }
+}
+
+#[derive(Clone, Default)]
+struct AuthValidator {
+    basic: Option<BasicAuthValidator>,
+    api_key: Option<ApiKeyValidator>,
+}
+
+impl AuthValidator {
+    fn from_env() -> Option<Self> {
+        let basic = BasicAuthValidator::from_env();
+        let api_key = ApiKeyValidator::from_env();
+        
+        if basic.is_none() && api_key.is_none() {
+            None
+        } else {
+            Some(Self { basic, api_key })
+        }
+    }
+    
+    fn validate(&self, api_key_header: Option<&str>, auth_header: Option<&str>) -> bool {
+        if let Some(ref api_key_validator) = self.api_key {
+            if api_key_validator.validate(api_key_header, auth_header) {
+                return true;
+            }
+        }
+        
+        if let Some(ref basic_validator) = self.basic {
+            if basic_validator.validate(auth_header) {
+                return true;
+            }
+        }
+        
+        false
+    }
+}
+
+// Middleware function for authentication
+async fn auth_middleware(
+    State(validator): State<AuthValidator>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -326,8 +404,13 @@ async fn basic_auth_middleware(
         .headers()
         .get("Authorization")
         .and_then(|value| value.to_str().ok());
+        
+    let api_key_header = request
+        .headers()
+        .get("X-Api-Key")
+        .and_then(|value| value.to_str().ok());
 
-    if validator.validate(auth_header) {
+    if validator.validate(api_key_header, auth_header) {
         next.run(request).await
     } else {
         // Return 401 Unauthorized with WWW-Authenticate header
@@ -601,7 +684,7 @@ async fn main() {
     let state = AppState::new(storage_path);
 
     // Check for authentication configuration
-    let auth_validator = BasicAuthValidator::from_env();
+    let auth_validator = AuthValidator::from_env();
 
     // Create static directory if it doesn't exist
     std::fs::create_dir_all("./static").ok();
@@ -673,13 +756,19 @@ async fn main() {
 
     // Apply authentication middleware if configured
     let app = if let Some(validator) = auth_validator {
-        info!("Basic authentication enabled for user: {}", validator.username);
+        if validator.basic.is_some() {
+            info!("Basic authentication enabled.");
+        }
+        if validator.api_key.is_some() {
+            info!("API Key authentication enabled.");
+        }
+        
         app.layer(middleware::from_fn_with_state(
             validator,
-            basic_auth_middleware,
+            auth_middleware,
         ))
     } else {
-        info!("Basic authentication disabled (set AUTH_USER and AUTH_PASSWORD to enable)");
+        info!("Authentication disabled (set AUTH_USER/AUTH_PASSWORD or RSQUEUE_API_KEYS to enable)");
         app
     };
     
@@ -690,4 +779,26 @@ async fn main() {
     info!("RSQueue server running on http://0.0.0.0:4000");
     
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_api_key_validator() {
+        let validator = ApiKeyValidator {
+            valid_keys: vec!["key-1".to_string(), "key-2".to_string()],
+        };
+
+        // Validate X-Api-Key
+        assert!(validator.validate(Some("key-1"), None));
+        assert!(validator.validate(Some("key-2"), None));
+        assert!(!validator.validate(Some("key-3"), None));
+
+        // Validate Bearer token fallback
+        assert!(validator.validate(None, Some("Bearer key-1")));
+        assert!(!validator.validate(None, Some("Bearer key-3")));
+        assert!(!validator.validate(None, Some("Basic dXNlcjpwYXNz")));
+    }
 }

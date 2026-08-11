@@ -252,6 +252,15 @@ rsqueue-cli delete-message task-queue 650e8400-e29b-41d4-a716-446655440001
 
 ## Configuration
 
+### Authentication
+
+RSQueue supports two methods for securing the API, configured via environment variables on the server:
+
+- **Basic Authentication**: Set `AUTH_USER` and `AUTH_PASSWORD`. Clients must send standard HTTP Basic Auth headers.
+- **API Keys**: Set `RSQUEUE_API_KEYS` to a comma-separated list of valid keys (e.g., `key1,key2`). Clients can authenticate by sending the `X-Api-Key` header or an `Authorization: Bearer <key>` header.
+
+If either is enabled, unauthenticated requests will be rejected with `401 Unauthorized`.
+
 ### Queue Settings
 
 - **`visibility_timeout_seconds`**: Duration (in seconds) that a message remains invisible after being retrieved. Default: 120 seconds (2 minutes)
@@ -311,8 +320,13 @@ The CLI tool supports configuration via environment variables:
 
 ```bash
 export RSQUEUE_URL=http://localhost:4000
+
+# For Basic Auth
 export RSQUEUE_USER=admin
 export RSQUEUE_PASSWORD=secret
+
+# OR For API Key Auth
+export RSQUEUE_API_KEY=my-secret-key
 
 rsqueue-cli list
 ```
