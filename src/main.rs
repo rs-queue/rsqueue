@@ -221,7 +221,9 @@ async fn get_metrics() -> Response {
         (status = 200, description = "Metrics summary", body = MetricsSummary)
     )
 )]
-async fn get_metrics_summary() -> Json<MetricsSummary> {
+async fn get_metrics_summary(State(state): State<AppState>) -> Json<MetricsSummary> {
+    state.update_global_metrics().await;
+
     Json(MetricsSummary {
         timestamp: Utc::now(),
         messages_enqueued_total: get_messages_enqueued_total(),
@@ -793,6 +795,52 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_metrics_summary_refreshes_queue_depths() {
+        let storage = tempfile::tempdir().unwrap();
+        let state = AppState::new(storage.path().to_path_buf());
+        let name = "dashboard-metrics".to_string();
+        let _ = create_queue(
+            State(state.clone()),
+            Json(serde_json::from_value(serde_json::json!({ "name": name })).unwrap()),
+        )
+        .await
+        .unwrap();
+        let _ = enqueue_message(
+            State(state.clone()),
+            Path(name.clone()),
+            Json(serde_json::from_value(serde_json::json!({ "content": "test" })).unwrap()),
+        )
+        .await
+        .unwrap();
+
+        let Json(pending) = get_metrics_summary(State(state.clone())).await;
+        assert_eq!(pending.active_queues, 1);
+        assert_eq!(pending.total_messages_pending, 1);
+        assert_eq!(pending.total_messages_in_flight, 0);
+
+        let Json(messages) = get_messages(
+            State(state.clone()),
+            Path(name.clone()),
+            Json(GetMessagesRequest { count: 1 }),
+        )
+        .await
+        .unwrap();
+        let Json(in_flight) = get_metrics_summary(State(state.clone())).await;
+        assert_eq!(in_flight.total_messages_pending, 0);
+        assert_eq!(in_flight.total_messages_in_flight, 1);
+
+        let deleted = delete_message(
+            State(state.clone()),
+            Path((name, messages[0].receipt_handle.unwrap())),
+        )
+        .await;
+        assert_eq!(deleted, StatusCode::NO_CONTENT);
+        let Json(empty) = get_metrics_summary(State(state)).await;
+        assert_eq!(empty.total_messages_pending, 0);
+        assert_eq!(empty.total_messages_in_flight, 0);
+    }
 
     #[test]
     fn test_api_key_validator() {

@@ -44,6 +44,17 @@ cargo run --release
 
 The server will start on `http://0.0.0.0:4000`
 
+### Web Dashboard
+
+Open [http://localhost:4000](http://localhost:4000) to use the built-in queue console.
+
+- Monitor pending and in-flight messages, queue capacity, and server lifecycle totals.
+- View incoming and outgoing traffic observed during the current browser session.
+- Search queues, create queues, send messages with priority or delay, and adjust size caps.
+- Filter, pause, and clear the live event display. The latest 100 events are kept in the browser.
+
+The responsive dashboard is served directly by RSQueue, with no frontend build step or external assets. Docker images include the dashboard files.
+
 ### CLI Tool
 
 ```bash
