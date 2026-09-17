@@ -28,6 +28,9 @@ WORKDIR /app
 # Copy the binary from builder stage
 COPY --from=builder /app/target/release/rsqueue .
 
+# Include the dashboard and its static assets in the runtime image.
+COPY --chown=app:app static ./static
+
 # Create directory for queue specs
 RUN mkdir -p queue_specs && chown -R app:app /app
 
