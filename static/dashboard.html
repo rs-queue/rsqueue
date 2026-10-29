@@ -191,6 +191,109 @@
               ><span class="metric-caption">Evicted since server start</span>
             </article>
           </div>
+          <section class="panel history-panel" aria-labelledby="historyTitle">
+            <div class="panel-heading history-heading">
+              <div>
+                <h2 id="historyTitle">Queue throughput</h2>
+                <p>
+                  Historical delivery and completion rates, in messages per
+                  second
+                </p>
+              </div>
+              <div class="history-filters">
+                <label
+                  >Queue<select id="historyQueue">
+                    <option value="">All queues</option>
+                  </select></label
+                >
+                <label
+                  >Period<select id="historyPeriod">
+                    <option value="15">Last 15 minutes</option>
+                    <option value="60" selected>Last hour</option>
+                    <option value="360">Last 6 hours</option>
+                    <option value="1440">Last 24 hours</option>
+                  </select></label
+                >
+              </div>
+            </div>
+            <div id="historyError" class="error-banner" role="alert" hidden>
+              <span id="historyErrorText"></span>
+              <button class="text-button" data-action="refresh-history">
+                Retry
+              </button>
+            </div>
+            <div class="history-stats">
+              <div>
+                <span>Delivered to consumers</span
+                ><strong id="historyDelivered">—</strong
+                ><small>Includes redeliveries</small>
+              </div>
+              <div>
+                <span>Acknowledged</span
+                ><strong id="historyAcknowledged">—</strong
+                ><small>Confirmed by consumers</small>
+              </div>
+              <div>
+                <span>Average consumption</span
+                ><strong id="historyAverage">—</strong
+                ><small>msg/s over this window</small>
+              </div>
+              <div>
+                <span>Peak consumption</span><strong id="historyPeak">—</strong
+                ><small id="historyPeakCaption">msg/s per interval</small>
+              </div>
+            </div>
+            <div class="chart-legend history-legend">
+              <span><i class="legend-line incoming"></i>Enqueued</span>
+              <span
+                ><i class="legend-line outgoing"></i>Delivered to
+                consumers</span
+              >
+              <span><i class="legend-line acknowledged"></i>Acknowledged</span>
+            </div>
+            <div class="chart history-chart">
+              <svg
+                id="historyChart"
+                viewBox="0 0 1000 210"
+                role="img"
+                aria-label="Historical queue throughput"
+                preserveAspectRatio="none"
+              ></svg>
+              <div id="historyEmpty" class="chart-empty" role="status">
+                <strong>Loading history…</strong
+                ><span>Fetching activity recorded by the server.</span>
+              </div>
+            </div>
+            <div class="chart-axis history-axis">
+              <span id="historyStart">—</span><span id="historyMiddle">—</span
+              ><span id="historyEnd">—</span>
+            </div>
+            <p id="historyUpdated" class="history-note">
+              History refreshes every 10 seconds.
+            </p>
+            <details class="history-details">
+              <summary>View interval totals</summary>
+              <div class="table-container history-table">
+                <table aria-label="Historical message counts by interval">
+                  <thead>
+                    <tr>
+                      <th scope="col">Interval start</th>
+                      <th scope="col" class="number-cell">Enqueued</th>
+                      <th scope="col" class="number-cell">Delivered</th>
+                      <th scope="col" class="number-cell">Acknowledged</th>
+                      <th scope="col" class="number-cell">Consumed / sec</th>
+                    </tr>
+                  </thead>
+                  <tbody id="historyRows"></tbody>
+                </table>
+              </div>
+            </details>
+            <p class="history-note history-retention">
+              Up to 24 hours of history for existing queues, even while this
+              page is closed. Resets when the server restarts or a queue is
+              deleted.
+            </p>
+          </section>
           <div class="overview-grid">
             <section class="panel traffic-panel" aria-labelledby="trafficTitle">
               <div class="panel-heading">

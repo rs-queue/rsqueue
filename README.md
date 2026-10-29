@@ -49,11 +49,17 @@ The server will start on `http://0.0.0.0:4000`
 Open [http://localhost:4000](http://localhost:4000) to use the built-in queue console.
 
 - Monitor pending and in-flight messages, queue capacity, and server lifecycle totals.
+- Explore server-recorded throughput for all queues or one queue over 15 minutes, 1 hour, 6 hours, or 24 hours.
+- Compare enqueued, delivered, and acknowledged rates, with delivered/acknowledged totals, average and peak consumption, and expandable interval totals. Deliveries include retries; acknowledgements count successful consumer confirmations only.
 - View incoming and outgoing traffic observed during the current browser session.
 - Search queues, create queues, send messages with priority or delay, and adjust size caps.
 - Filter, pause, and clear the live event display. The latest 100 events are kept in the browser.
 
 The responsive dashboard is served directly by RSQueue, with no frontend build step or external assets. Docker images include the dashboard files.
+
+Historical throughput refreshes every 10 seconds and uses 1-minute intervals for shorter periods and 5-minute intervals for longer periods. Rates use the elapsed time for the current, incomplete interval; peak rates are interval averages. Windows start on a minute boundary and include the current interval. The server retains up to 24 hours in memory for existing queues, including activity while the dashboard is closed. History resets on server restart or queue deletion.
+
+History is also available from `GET /stats/history` and `GET /queues/{name}/stats/history`, with `minutes` (1–1440, default 60) and `granularity_seconds` (a multiple of 60 from 60–86400, default 60). Invalid values return HTTP 400.
 
 ### CLI Tool
 

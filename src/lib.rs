@@ -323,7 +323,15 @@ pub struct TimeBucketStats {
     pub enqueued: u64,
     pub dequeued: u64,
     pub deleted: u64,
-    pub queue_depth_samples: Vec<usize>,
+    pub queue_depth_sum: u128,
+    pub queue_depth_count: u64,
+}
+
+impl TimeBucketStats {
+    fn record_depth(&mut self, depth: usize) {
+        self.queue_depth_sum += depth as u128;
+        self.queue_depth_count += 1;
+    }
 }
 
 #[derive(Debug)]
@@ -352,7 +360,7 @@ impl TimeSeriesTracker {
         let bucket_time = Self::truncate_to_minute(Utc::now());
         let stats = self.buckets.entry(bucket_time).or_default();
         stats.enqueued += 1;
-        stats.queue_depth_samples.push(queue_depth);
+        stats.record_depth(queue_depth);
         self.cleanup_old_buckets();
     }
 
@@ -360,7 +368,7 @@ impl TimeSeriesTracker {
         let bucket_time = Self::truncate_to_minute(Utc::now());
         let stats = self.buckets.entry(bucket_time).or_default();
         stats.dequeued += count as u64;
-        stats.queue_depth_samples.push(queue_depth);
+        stats.record_depth(queue_depth);
         self.cleanup_old_buckets();
     }
 
@@ -368,7 +376,7 @@ impl TimeSeriesTracker {
         let bucket_time = Self::truncate_to_minute(Utc::now());
         let stats = self.buckets.entry(bucket_time).or_default();
         stats.deleted += 1;
-        stats.queue_depth_samples.push(queue_depth);
+        stats.record_depth(queue_depth);
         self.cleanup_old_buckets();
     }
 
@@ -376,17 +384,23 @@ impl TimeSeriesTracker {
         let bucket_time = Self::truncate_to_minute(Utc::now());
         let stats = self.buckets.entry(bucket_time).or_default();
         stats.deleted += count as u64;
-        stats.queue_depth_samples.push(queue_depth);
+        stats.record_depth(queue_depth);
         self.cleanup_old_buckets();
     }
 
     fn cleanup_old_buckets(&mut self) {
-        let cutoff = Utc::now() - Duration::hours(self.max_retention_hours as i64);
-        self.buckets.retain(|time, _| *time >= cutoff);
+        let cutoff = Self::truncate_to_minute(Utc::now()) - Duration::hours(self.max_retention_hours as i64);
+        while self.buckets.first_key_value().is_some_and(|(time, _)| *time < cutoff) {
+            self.buckets.pop_first();
+        }
     }
 
     pub fn get_data_points(&self, from: DateTime<Utc>, to: DateTime<Utc>, granularity_seconds: u64) -> Vec<TimeSeriesPoint> {
         let mut result = Vec::new();
+        // Storage has minute resolution; finer or unaligned windows would duplicate counts.
+        if !(60..=86400).contains(&granularity_seconds) || granularity_seconds % 60 != 0 {
+            return result;
+        }
         let granularity = Duration::seconds(granularity_seconds as i64);
 
         let mut current = Self::truncate_to_minute(from);
@@ -401,18 +415,20 @@ impl TimeSeriesTracker {
 
             // Aggregate buckets within this granularity window
             let window_end = current + granularity;
-            let mut depth_samples = Vec::new();
+            let mut depth_sum = 0u128;
+            let mut depth_count = 0u64;
 
             for (_bucket_time, stats) in self.buckets.range(current..window_end) {
                 point.enqueued += stats.enqueued;
                 point.dequeued += stats.dequeued;
                 point.deleted += stats.deleted;
-                depth_samples.extend(&stats.queue_depth_samples);
+                depth_sum += stats.queue_depth_sum;
+                depth_count += stats.queue_depth_count;
             }
 
             // Use average queue depth for the window
-            if !depth_samples.is_empty() {
-                point.queue_depth = depth_samples.iter().sum::<usize>() / depth_samples.len();
+            if depth_count > 0 {
+                point.queue_depth = (depth_sum / depth_count as u128) as usize;
             }
 
             result.push(point);
@@ -1386,12 +1402,24 @@ pub struct QueueInfo {
 // Query parameters for time-series endpoints
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct TimeSeriesQuery {
-    /// Number of minutes to look back (default: 60)
+    /// Number of minutes to look back, from 1 to 1440 (default: 60)
     #[serde(default = "default_history_minutes")]
     pub minutes: u64,
-    /// Granularity in seconds for data aggregation (default: 60 = 1 minute)
+    /// Aggregation in seconds: a multiple of 60, from 60 to 86400 (default: 60)
     #[serde(default = "default_granularity")]
     pub granularity_seconds: u64,
+}
+
+impl TimeSeriesQuery {
+    fn validate(&self) -> Result<(), StatusCode> {
+        if !(1..=1440).contains(&self.minutes)
+            || !(60..=86400).contains(&self.granularity_seconds)
+            || self.granularity_seconds % 60 != 0
+        {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        Ok(())
+    }
 }
 
 pub fn default_history_minutes() -> u64 {
@@ -2126,6 +2154,7 @@ pub async fn list_all_messages(
     ),
     responses(
         (status = 200, description = "Time-series data for queue", body = QueueTimeSeries),
+        (status = 400, description = "Invalid history window or granularity"),
         (status = 404, description = "Queue not found")
     )
 )]
@@ -2134,6 +2163,7 @@ pub async fn get_queue_history(
     Path(queue_name): Path<String>,
     Query(params): Query<TimeSeriesQuery>,
 ) -> Result<Json<QueueTimeSeries>, StatusCode> {
+    params.validate()?;
     let _timer = HTTP_REQUEST_DURATION.start_timer();
     HTTP_REQUESTS_TOTAL.inc();
 
@@ -2141,7 +2171,7 @@ pub async fn get_queue_history(
 
     if let Some(queue) = queues.get(&queue_name) {
         let to = Utc::now();
-        let from = to - Duration::minutes(params.minutes as i64);
+        let from = TimeSeriesTracker::truncate_to_minute(to) - Duration::minutes(params.minutes as i64);
 
         let data_points = queue.time_series.get_data_points(from, to, params.granularity_seconds);
 
@@ -2163,19 +2193,21 @@ pub async fn get_queue_history(
     tag = "stats",
     params(TimeSeriesQuery),
     responses(
-        (status = 200, description = "Global time-series data across all queues", body = GlobalTimeSeries)
+        (status = 200, description = "Global time-series data across all queues", body = GlobalTimeSeries),
+        (status = 400, description = "Invalid history window or granularity")
     )
 )]
 pub async fn get_global_history(
     State(state): State<AppState>,
     Query(params): Query<TimeSeriesQuery>,
-) -> Json<GlobalTimeSeries> {
+) -> Result<Json<GlobalTimeSeries>, StatusCode> {
+    params.validate()?;
     let _timer = HTTP_REQUEST_DURATION.start_timer();
     HTTP_REQUESTS_TOTAL.inc();
 
     let queues = state.queues.read().await;
     let to = Utc::now();
-    let from = to - Duration::minutes(params.minutes as i64);
+    let from = TimeSeriesTracker::truncate_to_minute(to) - Duration::minutes(params.minutes as i64);
     let granularity = Duration::seconds(params.granularity_seconds as i64);
 
     // Collect all data points from all queues
@@ -2210,12 +2242,12 @@ pub async fn get_global_history(
 
     let data_points: Vec<TimeSeriesPoint> = aggregated.into_values().collect();
 
-    Json(GlobalTimeSeries {
+    Ok(Json(GlobalTimeSeries {
         data_points,
         from,
         to,
         granularity_seconds: params.granularity_seconds,
-    })
+    }))
 }
 
 #[cfg(test)]

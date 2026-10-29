@@ -35,6 +35,9 @@
     notificationTimer: null,
     dialog: null,
     submitting: false,
+    history: null,
+    historyRequest: 0,
+    historyLoading: false,
   };
   const views = {
     overview: [
@@ -139,6 +142,7 @@
     source.onopen = () => {
       updateConnection(true);
       refresh();
+      refreshHistory();
     };
     source.onerror = () => updateConnection(false);
     source.onmessage = (message) => {
@@ -209,6 +213,7 @@
           );
         state.queues = queues.sort((a, b) => a.name.localeCompare(b.name));
         state.loaded = true;
+        updateHistoryQueues();
         $("activeQueues").textContent = format(queues.length);
         const fields = {
           totalPending: "total_messages_pending",
@@ -413,6 +418,215 @@
     $("eventCount").textContent = format(filtered.length);
     $("eventsReceived").textContent =
       `${format(state.received)} events received`;
+  }
+
+  const formatRate = (value) =>
+    value > 0 && value < 0.01
+      ? "<0.01"
+      : value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+
+  function updateHistoryQueues() {
+    const select = $("historyQueue");
+    const selected = select.value;
+    const names = state.queues.map((queue) => queue.name);
+    const options =
+      '<option value="">All queues</option>' +
+      names
+        .map(
+          (name) =>
+            `<option value="${escapeHTML(name)}">${escapeHTML(name)}</option>`,
+        )
+        .join("") +
+      (selected && !names.includes(selected)
+        ? `<option value="${escapeHTML(selected)}">${escapeHTML(selected)} (deleted)</option>`
+        : "");
+    if (select.dataset.options !== options) {
+      select.innerHTML = options;
+      select.value = selected;
+      select.dataset.options = options;
+    }
+  }
+
+  async function refreshHistory(selectionChanged = false) {
+    if (state.historyLoading && !selectionChanged) return;
+    const requestId = ++state.historyRequest;
+    state.historyLoading = true;
+    if (selectionChanged) state.history = null;
+    $("historyError").hidden = true;
+    if (!state.history) {
+      for (const id of [
+        "historyDelivered",
+        "historyAcknowledged",
+        "historyAverage",
+        "historyPeak",
+        "historyStart",
+        "historyMiddle",
+        "historyEnd",
+      ])
+        $(id).textContent = "—";
+      $("historyChart").innerHTML = "";
+      $("historyRows").innerHTML = "";
+      $("historyUpdated").textContent = "Loading selected history…";
+      setHistoryEmpty(
+        "Loading history…",
+        "Fetching activity recorded by the server.",
+      );
+    }
+    const minutes = Number($("historyPeriod").value);
+    const granularity = minutes <= 60 ? 60 : 300;
+    const name = $("historyQueue").value;
+    const path = name ? `${queuePath(name)}/stats/history` : "/stats/history";
+    try {
+      const history = await request(
+        `${path}?minutes=${minutes}&granularity_seconds=${granularity}`,
+      );
+      if (requestId !== state.historyRequest) return;
+      if (
+        !Array.isArray(history?.data_points) ||
+        !Number.isFinite(Date.parse(history.from)) ||
+        !Number.isFinite(Date.parse(history.to)) ||
+        !(history.granularity_seconds > 0)
+      )
+        throw new Error("The server returned invalid history. Please retry.");
+      state.history = history;
+      renderHistory();
+    } catch (error) {
+      if (requestId !== state.historyRequest) return;
+      $("historyErrorText").textContent =
+        `${error.message}${state.history ? " Showing the last available history." : ""}`;
+      $("historyError").hidden = false;
+      if (!state.history) {
+        setHistoryEmpty(
+          "History unavailable",
+          "Use Retry to load this queue and period again.",
+        );
+        $("historyUpdated").textContent = "History could not be loaded.";
+      }
+    } finally {
+      if (requestId === state.historyRequest) state.historyLoading = false;
+    }
+  }
+
+  function setHistoryEmpty(title, description) {
+    $("historyEmpty").hidden = false;
+    $("historyEmpty").querySelector("strong").textContent = title;
+    $("historyEmpty").querySelector("span").textContent = description;
+  }
+
+  function renderHistory() {
+    const history = state.history;
+    const start = Date.parse(history.from);
+    const end = Date.parse(history.to);
+    const elapsed = Math.max((end - start) / 1000, 0.001);
+    const points = history.data_points.map((point) => {
+      // The latest bucket is still filling. Use elapsed seconds, not a full interval.
+      const seconds = Math.max(
+        0,
+        Math.min(
+          history.granularity_seconds,
+          (end - Date.parse(point.timestamp)) / 1000,
+        ),
+      );
+      return {
+        ...point,
+        incoming: seconds > 0 ? point.enqueued / seconds : 0,
+        consumed: seconds > 0 ? point.dequeued / seconds : 0,
+        acknowledged: seconds > 0 ? point.deleted / seconds : 0,
+      };
+    });
+    const totals = points.reduce(
+      (sum, point) => ({
+        enqueued: sum.enqueued + point.enqueued,
+        dequeued: sum.dequeued + point.dequeued,
+        deleted: sum.deleted + point.deleted,
+      }),
+      { enqueued: 0, dequeued: 0, deleted: 0 },
+    );
+    const peak = Math.max(0, ...points.map((point) => point.consumed));
+    $("historyDelivered").textContent = format(totals.dequeued);
+    $("historyAcknowledged").textContent = format(totals.deleted);
+    $("historyAverage").textContent = formatRate(totals.dequeued / elapsed);
+    $("historyPeak").textContent = formatRate(peak);
+    $("historyPeakCaption").textContent =
+      `msg/s per ${history.granularity_seconds / 60}-minute interval`;
+
+    const maximum = Math.max(
+      0.01,
+      ...points.flatMap((point) => [
+        point.incoming,
+        point.consumed,
+        point.acknowledged,
+      ]),
+    );
+    const magnitude = 10 ** Math.floor(Math.log10(maximum));
+    const ceiling = Math.ceil(maximum / magnitude) * magnitude;
+    const width = Math.max(260, $("historyChart").clientWidth);
+    const plotWidth = width - 58;
+    $("historyChart").setAttribute("viewBox", `0 0 ${width} 210`);
+    const axisRate = (value) =>
+      value.toLocaleString(undefined, {
+        notation: "compact",
+        maximumFractionDigits: ceiling < 0.1 ? 4 : 2,
+      });
+    const grid = Array.from({ length: 5 }, (_, index) => {
+      const y = 10 + index * 47;
+      return `<line x1="56" x2="${width - 2}" y1="${y}" y2="${y}" stroke="#edf0f5" stroke-dasharray="3 4"/><text x="0" y="${y + 4}" fill="#687287" font-size="11">${escapeHTML(axisRate((ceiling * (4 - index)) / 4))}</text>`;
+    }).join("");
+    const x = (index) =>
+      56 + (index * plotWidth) / Math.max(1, points.length - 1);
+    const line = (key, color, dash = "") => {
+      const path = points
+        .map(
+          (point, index) =>
+            `${index ? "L" : "M"}${x(index).toFixed(1)},${(198 - (point[key] / ceiling) * 188).toFixed(1)}`,
+        )
+        .join(" ");
+      return `<path d="${path}" fill="none" stroke="${color}" stroke-width="2.5" stroke-dasharray="${dash}" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>`;
+    };
+    const time = (timestamp) =>
+      new Date(timestamp).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    const description = (point) =>
+      `${new Date(point.timestamp).toLocaleString()}: ${format(point.enqueued)} enqueued, ${format(point.dequeued)} delivered, ${format(point.deleted)} acknowledged; ${formatRate(point.consumed)} consumed/sec.`;
+    const targets = points
+      .map((point, index) => {
+        const width = plotWidth / Math.max(1, points.length - 1);
+        return `<rect x="${Math.max(56, x(index) - width / 2).toFixed(1)}" y="0" width="${(index === 0 || index === points.length - 1 ? width / 2 : width).toFixed(1)}" height="210" fill="transparent"><title>${escapeHTML(description(point))}</title></rect>`;
+      })
+      .join("");
+    $("historyChart").innerHTML =
+      grid +
+      line("incoming", "#6654d9", "5 4") +
+      line("consumed", "#237e70") +
+      line("acknowledged", "#ac681d", "2 4") +
+      targets;
+    $("historyChart").setAttribute(
+      "aria-label",
+      `Historical throughput: ${format(totals.dequeued)} delivered to consumers, ${format(totals.deleted)} acknowledged. Average consumption ${formatRate(totals.dequeued / elapsed)} messages per second. Interval totals are available below.`,
+    );
+    setHistoryEmpty(
+      "No traffic in this period",
+      "Choose another queue or a longer period to see earlier activity.",
+    );
+    $("historyEmpty").hidden =
+      totals.enqueued + totals.dequeued + totals.deleted > 0;
+    const lastTimestamp = points.length
+      ? Date.parse(points[points.length - 1].timestamp)
+      : end;
+    $("historyStart").textContent = time(start);
+    $("historyMiddle").textContent = time((start + lastTimestamp) / 2);
+    $("historyEnd").textContent = time(lastTimestamp);
+    $("historyUpdated").textContent =
+      `${history.granularity_seconds / 60}-minute intervals · Latest interval still in progress · Updated ${new Date(end).toLocaleTimeString()}`;
+    $("historyRows").innerHTML = [...points]
+      .reverse()
+      .map(
+        (point) =>
+          `<tr><td>${escapeHTML(new Date(point.timestamp).toLocaleString())}</td><td class="number-cell">${format(point.enqueued)}</td><td class="number-cell">${format(point.dequeued)}</td><td class="number-cell">${format(point.deleted)}</td><td class="number-cell">${escapeHTML(formatRate(point.consumed))}</td></tr>`,
+      )
+      .join("");
   }
 
   function currentBucket() {
@@ -686,7 +900,11 @@
     if (["create", "limit", "send", "delete"].includes(action))
       openDialog(action, button.dataset.queue);
     if (action === "close-dialog") closeDialog();
-    if (action === "refresh") refresh();
+    if (action === "refresh") {
+      refresh();
+      refreshHistory();
+    }
+    if (action === "refresh-history") refreshHistory();
     if (action === "reset-search") {
       $("queueSearch").value = "";
       $("queueFilter").value = "all";
@@ -701,6 +919,11 @@
   });
   $("queueSearch").addEventListener("input", renderQueues);
   $("queueFilter").addEventListener("change", renderQueues);
+  $("historyQueue").addEventListener("change", () => refreshHistory(true));
+  $("historyPeriod").addEventListener("change", () => refreshHistory(true));
+  new ResizeObserver(() => {
+    if (state.history) renderHistory();
+  }).observe($("historyChart"));
   $("eventFilter").addEventListener("change", renderEvents);
   $("pauseEvents").addEventListener("click", () => {
     state.paused = !state.paused;
@@ -728,6 +951,7 @@
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) {
       refresh();
+      refreshHistory();
       renderChart();
     }
   });
@@ -736,9 +960,13 @@
   renderEvents();
   renderChart();
   refresh();
+  refreshHistory();
   connect();
   setInterval(renderChart, 1000);
   setInterval(() => {
-    if (!document.hidden) refresh();
+    if (!document.hidden) {
+      refresh();
+      refreshHistory();
+    }
   }, 10000);
 })();
